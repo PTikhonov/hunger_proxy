@@ -20,7 +20,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       DETECTIONS_STREAM: stream:detections
       STREAM_MAXLEN: "100000"
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_LEVEL: ${LOG_LEVEL:-DEBUG}
     ports:
       - "8000:8000"
     depends_on:

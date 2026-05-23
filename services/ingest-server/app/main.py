@@ -3,10 +3,11 @@ from __future__ import annotations
 import logging
 import sys
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 from fastapi import FastAPI, HTTPException, Request, status
 from redis.asyncio import Redis
+from starlette.datastructures import UploadFile
 
 from app.config import settings
 from app.normalizer import normalize_request
@@ -22,6 +23,10 @@ def configure_logging() -> None:
     )
     logging.getLogger("uvicorn").setLevel(getattr(logging, settings.log_level))
     logging.getLogger("uvicorn.access").setLevel(getattr(logging, settings.log_level))
+    logging.getLogger("multipart").setLevel(logging.WARNING)
+    logging.getLogger("python_multipart").setLevel(logging.WARNING)
+    logging.getLogger("python_multipart.multipart").setLevel(logging.WARNING)
+    logging.getLogger("redis").setLevel(logging.WARNING)
 
 
 configure_logging()
@@ -50,16 +55,48 @@ async def log_full_request_debug(request: Request) -> None:
     if not logger.isEnabledFor(logging.DEBUG):
         return
 
-    body = await request.body()
     headers = {key: value for key, value in request.headers.items()}
-    body_text = body.decode("utf-8", errors="replace")
+    content_type = request.headers.get("content-type", "")
+
+    if "multipart/form-data" in content_type:
+        form = await request.form()
+        fields: dict[str, Any] = {}
+        files: dict[str, Any] = {}
+
+        for key, value in form.multi_items():
+            if isinstance(value, UploadFile):
+                files[key] = {
+                    "filename": value.filename,
+                    "content_type": value.content_type,
+                    "size": value.size,
+                }
+            else:
+                fields[key] = value
+
+        logger.debug(
+            "Full incoming multipart request: method=%s url=%s client=%s headers=%s fields=%s files=%s",
+            request.method,
+            str(request.url),
+            request.client.host if request.client else None,
+            headers,
+            fields,
+            files,
+        )
+        return
+
+    body = await request.body()
+    if content_type.startswith("text/") or "json" in content_type or "form-urlencoded" in content_type:
+        body_repr = body.decode("utf-8", errors="replace")
+    else:
+        body_repr = f"<binary body: {len(body)} bytes>"
+
     logger.debug(
         "Full incoming request: method=%s url=%s client=%s headers=%s body=%s",
         request.method,
         str(request.url),
         request.client.host if request.client else None,
         headers,
-        body_text,
+        body_repr,
     )
 
 
@@ -104,7 +141,7 @@ async def ingest(request: Request) -> dict[str, str]:
     }
 
 
-@app.post("/v1/detections", status_code=status.HTTP_202_ACCEPTED)
+@app.post("/video-detector/frame", status_code=status.HTTP_202_ACCEPTED)
 async def post_detection(request: Request) -> dict[str, str]:
     return await ingest(request)
 

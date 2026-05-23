@@ -11,10 +11,10 @@ docker compose up --build
 ## Endpoints
 
 - `GET /health` - service health.
-- `POST /v1/detections` - preferred JSON or multipart ingestion endpoint.
+- `POST /video-detector/frame` - preferred JSON or multipart ingestion endpoint.
 - `POST /context_pers` - legacy-compatible ingestion endpoint name.
 
- `POST http://192.168.1.10:8000/v1/detections`
+ `POST http://192.168.1.10:8000/video-detector/frame`
 
 ## Redis Stream
 
