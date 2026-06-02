@@ -1,11 +1,24 @@
 services:
-  redis:
+  redis-streams:
     image: redis:7.2-alpine
     command: redis-server --appendonly yes
     ports:
       - "6379:6379"
     volumes:
-      - redis-data:/data
+      - redis-streams-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis-hot-state:
+    image: redis:7.2-alpine
+    command: redis-server --appendonly yes
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis-hot-state-data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -17,16 +30,98 @@ services:
       context: ./services/ingest-server
     environment:
       APP_NAME: ingest-server
-      REDIS_URL: redis://redis:6379/0
+      REDIS_URL: redis://redis-streams:6379/0
       DETECTIONS_STREAM: stream:detections
       STREAM_MAXLEN: "100000"
+      NORMALIZED_MEDIA_FIELD: ${NORMALIZED_MEDIA_FIELD:-normalized}
+      FULL_FRAME_MEDIA_FIELD: ${FULL_FRAME_MEDIA_FIELD:-photo}
+      MEDIA_KEY_PREFIX: ${MEDIA_KEY_PREFIX:-media:detection}
+      MEDIA_TTL_SECONDS: ${MEDIA_TTL_SECONDS:-120}
+      MEDIA_SAVE_JOBS_STREAM: stream:media-save-jobs
+      FFUPLOAD_BASE_URL: ${FFUPLOAD_BASE_URL:-http://192.168.1.25:3333/uploads}
+      MEDIA_URL_BASE: ${MEDIA_URL_BASE:-http://192.168.1.25:3333/uploads}
       LOG_LEVEL: ${LOG_LEVEL:-DEBUG}
     ports:
       - "8000:8000"
     depends_on:
-      redis:
+      redis-streams:
+        condition: service_healthy
+
+  media-uploader:
+    build:
+      context: ./services/media-uploader
+    environment:
+      APP_NAME: media-uploader
+      REDIS_URL: redis://redis-streams:6379/0
+      MEDIA_SAVE_JOBS_STREAM: stream:media-save-jobs
+      MEDIA_SAVE_CONSUMER_GROUP: media-uploader
+      MEDIA_SAVE_BATCH_SIZE: ${MEDIA_SAVE_BATCH_SIZE:-10}
+      MEDIA_SAVE_BLOCK_MS: ${MEDIA_SAVE_BLOCK_MS:-5000}
+      MEDIA_SAVE_PENDING_IDLE_MS: ${MEDIA_SAVE_PENDING_IDLE_MS:-30000}
+      FFUPLOAD_TIMEOUT_SECONDS: ${FFUPLOAD_TIMEOUT_SECONDS:-10}
+      MEDIA_DELETE_AFTER_UPLOAD: ${MEDIA_DELETE_AFTER_UPLOAD:-false}
+      LOG_LEVEL: ${LOG_LEVEL:-DEBUG}
+    depends_on:
+      redis-streams:
+        condition: service_healthy
+
+  visitor-state-processor:
+    build:
+      context: ./services/visitor-state-processor
+    environment:
+      APP_NAME: visitor-state-processor
+      REDIS_STREAM_URL: redis://redis-streams:6379/0
+      REDIS_HOT_STATE_URL: redis://redis-hot-state:6379/0
+      DETECTIONS_STREAM: stream:detections
+      DETECTIONS_CONSUMER_GROUP: visitor-state-processor
+      IDENTITY_OBSERVATIONS_STREAM: stream:identity-observations
+      STREAM_MAXLEN: "100000"
+      BATCH_SIZE: ${VISITOR_PROCESSOR_BATCH_SIZE:-10}
+      BLOCK_MS: ${VISITOR_PROCESSOR_BLOCK_MS:-5000}
+      PENDING_IDLE_MS: ${VISITOR_PROCESSOR_PENDING_IDLE_MS:-30000}
+      EXTRACTION_API_URL: ${EXTRACTION_API_URL:-http://192.168.1.25:18666/v2}
+      EXTRACTION_TIMEOUT_SECONDS: ${EXTRACTION_TIMEOUT_SECONDS:-5}
+      EXTRACTION_IMAGE_FIELD: ${EXTRACTION_IMAGE_FIELD:-sample}
+      FACE_EXTRACTION_DETECTOR: ${FACE_EXTRACTION_DETECTOR:-face}
+      FACE_EXTRACTION_ATTRIBUTES: ${FACE_EXTRACTION_ATTRIBUTES:-face_emben}
+      FACE_EMBEDDING_FIELD: ${FACE_EMBEDDING_FIELD:-face_emben}
+      FACE_AGE_FIELD: ${FACE_AGE_FIELD:-face_age}
+      FACE_GENDER_FIELD: ${FACE_GENDER_FIELD:-face_gender}
+      FACE_EXTRACTION_NEED_AGE: ${FACE_EXTRACTION_NEED_AGE:-true}
+      FACE_EXTRACTION_NEED_GENDER: ${FACE_EXTRACTION_NEED_GENDER:-true}
+      SILHOUETTE_EXTRACTION_DETECTOR: ${SILHOUETTE_EXTRACTION_DETECTOR:-body}
+      SILHOUETTE_EXTRACTION_ATTRIBUTES: ${SILHOUETTE_EXTRACTION_ATTRIBUTES:-body_emben}
+      SILHOUETTE_EMBEDDING_FIELD: ${SILHOUETTE_EMBEDDING_FIELD:-body_emben}
+      SILHOUETTE_AGE_FIELD: ${SILHOUETTE_AGE_FIELD:-body_age_gender}
+      SILHOUETTE_GENDER_FIELD: ${SILHOUETTE_GENDER_FIELD:-body_age_gender}
+      SILHOUETTE_EXTRACTION_NEED_AGE: ${SILHOUETTE_EXTRACTION_NEED_AGE:-true}
+      SILHOUETTE_EXTRACTION_NEED_GENDER: ${SILHOUETTE_EXTRACTION_NEED_GENDER:-true}
+      NORMALIZED_MEDIA_FIELD: ${NORMALIZED_MEDIA_FIELD:-normalized}
+      FACE_IDENTITY_CONFIDENCE_THRESHOLD: ${FACE_IDENTITY_CONFIDENCE_THRESHOLD:-0.714}
+      SILHOUETTE_IDENTITY_CONFIDENCE_THRESHOLD: ${SILHOUETTE_IDENTITY_CONFIDENCE_THRESHOLD:-0.703}
+      IDENTITY_TTL_SECONDS: ${IDENTITY_TTL_SECONDS:-3600}
+      PRESENCE_GAP_SECONDS: ${PRESENCE_GAP_SECONDS:-10}
+      LOG_LEVEL: ${LOG_LEVEL:-DEBUG}
+    depends_on:
+      redis-streams:
+        condition: service_healthy
+      redis-hot-state:
+        condition: service_healthy
+
+  state-visualizer:
+    build:
+      context: ./services/state-visualizer
+    environment:
+      APP_NAME: state-visualizer
+      REDIS_HOT_STATE_URL: redis://redis-hot-state:6379/0
+      IDENTITY_SCAN_COUNT: ${IDENTITY_SCAN_COUNT:-500}
+      STATE_VISUALIZER_POLL_INTERVAL_MS: ${STATE_VISUALIZER_POLL_INTERVAL_MS:-1500}
+    ports:
+      - "8080:8080"
+    depends_on:
+      redis-hot-state:
         condition: service_healthy
 
 volumes:
-  redis-data:
-
+  redis-streams-data:
+  redis-hot-state-data:

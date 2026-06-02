@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from typing import Any
 
 from fastapi import Request
 from starlette.datastructures import UploadFile
 
 from app.schemas import DetectionEvent
+
+
+@dataclass
+class IngestedRequest:
+    event: DetectionEvent
+    blobs: dict[str, bytes]
 
 
 JSON_KEYS = {
@@ -82,23 +89,25 @@ def _normalize_mapping(data: dict[str, Any], media: dict[str, Any] | None = None
     )
 
 
-async def normalize_request(request: Request) -> DetectionEvent:
+async def normalize_request(request: Request) -> IngestedRequest:
     content_type = request.headers.get("content-type", "")
 
     if "application/json" in content_type:
         body = await request.json()
         if not isinstance(body, dict):
             raise ValueError("JSON request body must be an object")
-        return _normalize_mapping(body)
+        return IngestedRequest(event=_normalize_mapping(body), blobs={})
 
     if "multipart/form-data" in content_type or "application/x-www-form-urlencoded" in content_type:
         form = await request.form()
         fields: dict[str, Any] = {}
         media: dict[str, Any] = {}
+        blobs: dict[str, bytes] = {}
 
         for key, value in form.multi_items():
             if isinstance(value, UploadFile):
                 content = await value.read()
+                blobs[key] = content
                 media[key] = {
                     "filename": value.filename,
                     "content_type": value.content_type,
@@ -108,7 +117,6 @@ async def normalize_request(request: Request) -> DetectionEvent:
             else:
                 fields[key] = value
 
-        return _normalize_mapping(fields, media)
+        return IngestedRequest(event=_normalize_mapping(fields, media), blobs=blobs)
 
     raise ValueError(f"Unsupported content type: {content_type or '<empty>'}")
-

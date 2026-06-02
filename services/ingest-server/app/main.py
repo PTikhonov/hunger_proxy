@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import sys
 from contextlib import asynccontextmanager
+from pathlib import PurePosixPath
 from typing import Any, AsyncIterator
 
 from fastapi import FastAPI, HTTPException, Request, status
@@ -49,6 +50,95 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)
+
+
+def _normalized_blob_candidates() -> tuple[str, ...]:
+    return _field_candidates(settings.normalized_media_field)
+
+
+def _field_candidates(field: str) -> tuple[str, ...]:
+    if field.startswith("multipart:"):
+        return (field, field.removeprefix("multipart:"))
+    return (field, f"multipart:{field}")
+
+
+def _join_url(base_url: str, filename: str) -> str:
+    return f"{base_url.rstrip('/')}/{filename.lstrip('/')}"
+
+
+def _media_filename(event_id: str, media_type: str, media_info: dict[str, Any]) -> str:
+    extension = PurePosixPath(str(media_info.get("filename") or "")).suffix
+    if not extension:
+        content_type = str(media_info.get("content_type") or "")
+        extension = ".png" if "png" in content_type else ".jpg"
+    suffix = "norm" if media_type == "normalized" else "full"
+    return f"{event_id}_{suffix}{extension}"
+
+
+async def store_media_blobs(request: Request, event_id: str, blobs: dict[str, bytes], media: dict[str, Any]) -> None:
+    await _store_media_blob(
+        request=request,
+        event_id=event_id,
+        blobs=blobs,
+        media=media,
+        media_type="normalized",
+        field_candidates=_normalized_blob_candidates(),
+    )
+    await _store_media_blob(
+        request=request,
+        event_id=event_id,
+        blobs=blobs,
+        media=media,
+        media_type="full_frame",
+        field_candidates=_field_candidates(settings.full_frame_media_field),
+    )
+
+
+async def _store_media_blob(
+    request: Request,
+    event_id: str,
+    blobs: dict[str, bytes],
+    media: dict[str, Any],
+    media_type: str,
+    field_candidates: tuple[str, ...],
+) -> None:
+    for field in field_candidates:
+        content = blobs.get(field)
+        if content is None:
+            continue
+
+        media_info = media.setdefault(field, {})
+        filename = _media_filename(event_id, media_type, media_info)
+        redis_key = f"{settings.media_key_prefix}:{event_id}:{media_type}"
+        await request.app.state.redis.set(redis_key, content, ex=settings.media_ttl_seconds)
+
+        media_info.update(
+            {
+                "media_type": media_type,
+                "redis_key": redis_key,
+                "ttl_seconds": settings.media_ttl_seconds,
+                "upload_url": _join_url(settings.ffupload_base_url, filename),
+                "public_url": _join_url(settings.media_url_base, filename),
+                "upload_status": "pending",
+            }
+        )
+        logger.debug(
+            "Stored media blob event_id=%s field=%s media_type=%s redis_key=%s bytes=%s ttl_seconds=%s",
+            event_id,
+            field,
+            media_type,
+            redis_key,
+            len(content),
+            settings.media_ttl_seconds,
+        )
+        return
+
+    logger.debug(
+        "No media field found event_id=%s expected_fields=%s available_fields=%s",
+        event_id,
+        field_candidates,
+        sorted(blobs.keys()),
+    )
 
 
 async def log_full_request_debug(request: Request) -> None:
@@ -109,8 +199,11 @@ async def health() -> dict[str, str]:
 async def ingest(request: Request) -> dict[str, str]:
     try:
         await log_full_request_debug(request)
-        event = await normalize_request(request)
+        ingested = await normalize_request(request)
+        event = ingested.event
+        await store_media_blobs(request, event.event_id, ingested.blobs, event.media)
         stream_id = await request.app.state.stream_writer.append(event)
+        media_job_id = await request.app.state.stream_writer.append_media_save_job(event.event_id, event.media)
     except ValueError as exc:
         logger.info("Rejected request: %s", exc)
         raise HTTPException(
@@ -131,6 +224,12 @@ async def ingest(request: Request) -> dict[str, str]:
         stream_id,
         event.camera_id,
         event.event_timestamp,
+    )
+    logger.info(
+        "Queued media save job event_id=%s stream=%s stream_id=%s",
+        event.event_id,
+        settings.media_save_jobs_stream,
+        media_job_id,
     )
 
     return {
