@@ -97,17 +97,35 @@ class VisitorStateProcessor:
                 content_type=str(media_info.get("content_type") or "image/jpeg"),
             )
             resolution = self._identities.resolve(detection_type, extraction.embedding)
-            await self._update_hot_state(payload, extraction, resolution.identity.identity_id, detection_type)
+            await self._update_hot_state(
+                payload,
+                extraction,
+                resolution.identity.identity_id,
+                detection_type,
+                resolution.is_new,
+            )
 
+            identity_threshold = self._identity_threshold(detection_type)
+            observed_ts = self._observed_timestamp(payload)
             observation = IdentityObservation(
                 source_event_id=payload.event_id,
                 identity_id=resolution.identity.identity_id,
                 detection_type=detection_type,
                 is_new_identity=resolution.is_new,
+                new_face=detection_type == "face" and resolution.is_new,
+                new_body=detection_type == "silhouette" and resolution.is_new,
                 match_confidence=resolution.confidence,
+                identity_threshold=identity_threshold,
                 extraction_confidence=extraction.confidence,
+                embedding={
+                    "kind": "face" if detection_type == "face" else "body",
+                    "model": self._embedding_model(detection_type),
+                    "source": "last",
+                    "value": extraction.embedding,
+                },
                 camera_id=payload.camera_id,
                 event_timestamp=payload.event_timestamp,
+                event_epoch=observed_ts,
                 track_id=payload.track_id,
                 bbox=payload.bbox,
                 age=extraction.age if extraction.age is not None else payload.age,
@@ -170,12 +188,23 @@ class VisitorStateProcessor:
             return "silhouette"
         return "face"
 
+    def _identity_threshold(self, detection_type: str) -> float:
+        if detection_type == "face":
+            return settings.face_identity_confidence_threshold
+        return settings.silhouette_identity_confidence_threshold
+
+    def _embedding_model(self, detection_type: str) -> str:
+        if detection_type == "face":
+            return settings.face_embedding_field
+        return settings.silhouette_embedding_field
+
     async def _update_hot_state(
         self,
         payload: DetectionPayload,
         extraction: Any,
         identity_id: str,
         detection_type: str,
+        is_new_identity: bool,
     ) -> None:
         now = datetime.now(timezone.utc).isoformat()
         observed_ts = self._observed_timestamp(payload)
@@ -193,6 +222,8 @@ class VisitorStateProcessor:
         mapping = {
             "identity_id": identity_id,
             "detection_type": detection_type,
+            "new_face": "true" if detection_type == "face" and is_new_identity else "false",
+            "new_body": "true" if detection_type == "silhouette" and is_new_identity else "false",
             "camera_id": payload.camera_id or "",
             "last_camera_id": payload.camera_id or "",
             "camera_ids": json.dumps(camera_ids, ensure_ascii=True),

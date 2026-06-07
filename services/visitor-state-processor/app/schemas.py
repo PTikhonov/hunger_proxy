@@ -16,6 +16,7 @@ class DetectionPayload(BaseModel):
     source: str | None = None
     camera_id: str | None = None
     event_timestamp: str | None = None
+    event_epoch: float | None = None
     track_id: str | None = None
     face_id: str | None = None
     silhouette_id: str | None = None
@@ -48,11 +49,16 @@ class IdentityObservation(BaseModel):
     identity_id: str
     detection_type: str
     is_new_identity: bool
+    new_face: bool = False
+    new_body: bool = False
     match_confidence: float | None = None
+    identity_threshold: float | None = None
     extraction_confidence: float | None = None
+    embedding: dict[str, Any] | None = None
 
     camera_id: str | None = None
     event_timestamp: str | None = None
+    event_epoch: float | None = None
     track_id: str | None = None
     bbox: Any | None = None
     age: int | float | None = None
@@ -67,8 +73,11 @@ class IdentityObservation(BaseModel):
             "source_event_id": self.source_event_id,
             "identity_id": self.identity_id,
             "detection_type": self.detection_type,
+            "new_face": "true" if self.new_face else "false",
+            "new_body": "true" if self.new_body else "false",
             "camera_id": self.camera_id or "",
             "event_timestamp": self.event_timestamp or "",
+            "event_epoch": "" if self.event_epoch is None else str(self.event_epoch),
             "observed_at": self.observed_at.isoformat(),
             "payload": self.model_dump_json(),
         }

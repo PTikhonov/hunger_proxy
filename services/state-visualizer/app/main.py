@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import FastAPI
+import httpx
+from fastapi import Body, FastAPI
 from fastapi.responses import HTMLResponse
 from redis.asyncio import Redis
 
@@ -48,6 +50,13 @@ async def state() -> dict[str, Any]:
         ttl_seconds = await redis.ttl(key)
         identities.append(_identity_from_hash(str(key), fields, ttl_seconds))
 
+    async for key in redis.scan_iter(match="person:*", count=settings.identity_scan_count):
+        fields = await redis.hgetall(key)
+        if not fields:
+            continue
+        ttl_seconds = await redis.ttl(key)
+        identities.append(_person_from_hash(str(key), fields, ttl_seconds))
+
     async for key in redis.scan_iter(match="identity_camera:*", count=settings.identity_scan_count):
         fields = await redis.hgetall(key)
         if not fields:
@@ -75,14 +84,28 @@ async def state() -> dict[str, Any]:
 
 
 @app.post("/api/admin/clear-hot-state")
-async def clear_hot_state() -> dict[str, Any]:
+async def clear_hot_state(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
     assert redis is not None
+    delete_media = bool(payload.get("delete_media", True))
+    media_stats = {
+        "requested": 0,
+        "deleted": 0,
+        "missing": 0,
+        "failed": 0,
+        "failures": [],
+    }
+    if delete_media:
+        media_urls = await _collect_media_urls()
+        media_stats = await _delete_media_urls(media_urls)
+
     deleted = 0
     async for key in redis.scan_iter(match="*", count=settings.identity_scan_count):
         deleted += await redis.delete(key)
     return {
         "status": "ok",
         "deleted_keys": deleted,
+        "media_delete_requested": delete_media,
+        "media": media_stats,
         "cleared_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -92,6 +115,102 @@ async def index() -> str:
     return INDEX_HTML
 
 
+async def _collect_media_urls() -> list[str]:
+    assert redis is not None
+    urls: set[str] = set()
+    async for key in redis.scan_iter(match="identity:*", count=settings.identity_scan_count):
+        media_links_raw = await redis.hget(key, "media_links")
+        for item in _json_list(media_links_raw):
+            url = item.get("upload_url") or item.get("public_url")
+            if url:
+                urls.add(str(url))
+    return sorted(urls)
+
+
+async def _delete_media_urls(urls: list[str]) -> dict[str, Any]:
+    stats: dict[str, Any] = {
+        "requested": len(urls),
+        "deleted": 0,
+        "missing": 0,
+        "failed": 0,
+        "failures": [],
+    }
+    if not urls:
+        return stats
+
+    semaphore = asyncio.Semaphore(settings.media_delete_concurrency)
+    async with httpx.AsyncClient(timeout=settings.media_delete_timeout_seconds) as client:
+        results = await asyncio.gather(*[_delete_media_url(client, semaphore, url) for url in urls])
+
+    for result in results:
+        status = result["status"]
+        if status == "deleted":
+            stats["deleted"] += 1
+        elif status == "missing":
+            stats["missing"] += 1
+        else:
+            stats["failed"] += 1
+            if len(stats["failures"]) < 20:
+                stats["failures"].append({"url": result["url"], "status_code": result.get("status_code")})
+    return stats
+
+
+async def _delete_media_url(client: httpx.AsyncClient, semaphore: asyncio.Semaphore, url: str) -> dict[str, Any]:
+    async with semaphore:
+        try:
+            response = await client.delete(url)
+        except httpx.HTTPError:
+            return {"url": url, "status": "failed", "status_code": None}
+
+    if response.status_code in {200, 202, 204}:
+        return {"url": url, "status": "deleted", "status_code": response.status_code}
+    if response.status_code == 404:
+        return {"url": url, "status": "missing", "status_code": response.status_code}
+    return {"url": url, "status": "failed", "status_code": response.status_code}
+
+
+def _person_from_hash(key: str, fields: dict[str, str], ttl_seconds: int) -> dict[str, Any]:
+    linked_at = fields.get("linked_at") or fields.get("created_at") or fields.get("updated_at") or ""
+    sort_epoch = _person_sort_epoch(fields)
+    face_identity_ids = _append_unique_strings(
+        _json_string_list(fields.get("face_identity_ids")),
+        fields.get("face_identity_id"),
+        fields.get("primary_face_identity_id"),
+        fields.get("last_face_identity_id"),
+    )
+    silhouette_identity_ids = _append_unique_strings(
+        _json_string_list(fields.get("silhouette_identity_ids")),
+        fields.get("silhouette_identity_id"),
+        fields.get("primary_silhouette_identity_id"),
+        fields.get("last_silhouette_identity_id"),
+    )
+
+    return {
+        "key": key,
+        "bucket": "matched",
+        "identity_id": fields.get("person_id") or key,
+        "detection_type": "person",
+        "person_id": fields.get("person_id") or key,
+        "ttl_seconds": ttl_seconds,
+        "ttl_display": _ttl_display(ttl_seconds),
+        "duration_seconds": 0.0,
+        "duration_display": "0.0s",
+        "not_seen_seconds": 0.0,
+        "not_seen_display": "0.0s",
+        "first_seen_epoch_sort": sort_epoch,
+        "last_seen_epoch_sort": sort_epoch,
+        "media_links": [],
+        "camera_states": [],
+        "fields": _display_fields(fields),
+        "linked_face_identity_id": face_identity_ids[0] if face_identity_ids else "",
+        "linked_silhouette_identity_id": silhouette_identity_ids[0] if silhouette_identity_ids else "",
+        "linked_face_identity_ids": face_identity_ids,
+        "linked_silhouette_identity_ids": silhouette_identity_ids,
+        "linked_at": _format_iso(linked_at),
+        "match_confidence": fields.get("match_confidence") or "",
+    }
+
+
 def _identity_from_hash(key: str, fields: dict[str, str], ttl_seconds: int) -> dict[str, Any]:
     media_links = _json_list(fields.get("media_links"))
     media_links.sort(key=lambda item: str(item.get("event_timestamp") or item.get("source_event_id") or ""))
@@ -99,7 +218,7 @@ def _identity_from_hash(key: str, fields: dict[str, str], ttl_seconds: int) -> d
 
     detection_type = fields.get("detection_type") or ""
     person_id = fields.get("person_id") or fields.get("matched_person_id") or fields.get("person_identity_id") or ""
-    bucket = "matched" if person_id else ("silhouette" if detection_type == "silhouette" else "face")
+    bucket = "silhouette" if detection_type == "silhouette" else "face"
 
     return {
         "key": key,
@@ -160,11 +279,47 @@ def _json_list(value: str | None) -> list[dict[str, Any]]:
     return [item for item in parsed if isinstance(item, dict)]
 
 
+def _json_string_list(value: str | None) -> list[str]:
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [str(item) for item in parsed if str(item)]
+
+
+def _append_unique_strings(values: list[str], *items: str | None) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in [*values, *items]:
+        normalized = str(item or "").strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(normalized)
+    return result
+
+
 def _float_or_zero(value: str | None) -> float:
     try:
         return float(value or 0.0)
     except ValueError:
         return 0.0
+
+
+def _person_sort_epoch(fields: dict[str, str]) -> float:
+    for key in ("linked_at", "created_at", "updated_at"):
+        value = fields.get(key)
+        if not value:
+            continue
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            continue
+    return 0.0
 
 
 def _display_fields(fields: dict[str, str]) -> dict[str, str]:
@@ -179,7 +334,7 @@ def _display_fields(fields: dict[str, str]) -> dict[str, str]:
 def _display_value(key: str, value: str) -> str:
     if key in {"first_seen_epoch", "last_seen_epoch"}:
         return _format_epoch(value)
-    if key in {"last_seen_at", "first_seen_at", "event_timestamp", "updated_at"}:
+    if key in {"last_seen_at", "first_seen_at", "event_timestamp", "updated_at", "linked_at"}:
         return _format_iso(value)
     return value
 
@@ -345,6 +500,42 @@ INDEX_HTML = r"""
       cursor: wait;
     }
 
+    .icon-button {
+      width: 34px;
+      height: 34px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #f8fafb;
+      color: var(--text);
+      font-size: 15px;
+      line-height: 1;
+      cursor: pointer;
+    }
+
+    .icon-button:hover {
+      background: #eef3f6;
+    }
+
+    .menu-check {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      min-height: 34px;
+      color: var(--muted);
+      font-size: 13px;
+      white-space: nowrap;
+      user-select: none;
+    }
+
+    .menu-check input {
+      width: 15px;
+      height: 15px;
+      margin: 0;
+    }
+
     main {
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -398,6 +589,11 @@ INDEX_HTML = r"""
     .silhouette .card { border-left-color: var(--sil); }
     .matched .card { border-left-color: var(--match); }
 
+    .card.highlight {
+      outline: 3px solid #2f9e85;
+      outline-offset: 2px;
+    }
+
     .card-head {
       padding: 10px 12px;
       border-bottom: 1px solid var(--line);
@@ -414,6 +610,23 @@ INDEX_HTML = r"""
       color: var(--muted);
       font-size: 12px;
       overflow-wrap: anywhere;
+    }
+
+    .jump-link {
+      border: 0;
+      padding: 0;
+      background: transparent;
+      color: #1f679a;
+      font: inherit;
+      font-size: 12px;
+      text-align: left;
+      text-decoration: underline;
+      cursor: pointer;
+      overflow-wrap: anywhere;
+    }
+
+    .jump-link:hover {
+      color: #174b70;
     }
 
     .camera-states {
@@ -535,6 +748,11 @@ INDEX_HTML = r"""
     </div>
     <nav aria-label="Management">
       <span class="menu-item">Redis Hot State</span>
+      <button class="icon-button" id="refresh-toggle" type="button" title="Pause updates" aria-label="Pause updates">▶</button>
+      <label class="menu-check">
+        <input id="delete-media" type="checkbox" checked />
+        <span>Delete media files</span>
+      </label>
       <button class="menu-item danger" id="clear-hot-state" type="button">Clear all hot state</button>
     </nav>
   </header>
@@ -569,6 +787,10 @@ INDEX_HTML = r"""
 
     let pollMs = 1500;
     const openDetails = new Set();
+    let pollTimer = null;
+    let updatesPaused = false;
+
+    const refreshToggle = document.getElementById("refresh-toggle");
 
     function esc(value) {
       return String(value ?? "").replace(/[&<>"']/g, ch => ({
@@ -679,23 +901,47 @@ INDEX_HTML = r"""
       `;
     }
 
+    function personMeta(identity) {
+      if (identity.detection_type !== "person") {
+        return "";
+      }
+      const faceLinks = identityLinks(identity.linked_face_identity_ids || [identity.linked_face_identity_id]);
+      const bodyLinks = identityLinks(identity.linked_silhouette_identity_ids || [identity.linked_silhouette_identity_id]);
+      return `
+        <div class="meta">face ${faceLinks || ""}</div>
+        <div class="meta">body ${bodyLinks || ""}</div>
+        <div class="meta">confidence ${esc(identity.match_confidence || "")} | linked ${esc(identity.linked_at || "")}</div>
+      `;
+    }
+
+    function identityLinks(identityIds) {
+      return (identityIds || [])
+        .filter(Boolean)
+        .map(identityId => `
+          <button class="jump-link" type="button" data-jump-identity="${esc(identityId)}">${esc(identityId)}</button>
+        `)
+        .join(", ");
+    }
+
     function card(identity) {
       const fieldsKey = `${identity.key}:fields`;
+      const isPerson = identity.detection_type === "person";
       return `
-        <article class="card">
+        <article class="card" data-identity-id="${esc(identity.identity_id)}">
           <div class="card-head">
             <div class="identity">${esc(identity.identity_id)}</div>
             <div class="meta">${esc(identity.key)}</div>
             <div class="meta">TTL ${esc(identity.ttl_display || "")} | duration ${esc(identity.duration_display || "0.0s")} | not seen ${esc(identity.not_seen_display || "0.0s")}</div>
             <div class="meta">${esc(identity.detection_type)} ${identity.person_id ? "-> " + esc(identity.person_id) : ""}</div>
-            ${cameraStates(identity.camera_states || [])}
+            ${personMeta(identity)}
+            ${isPerson ? "" : cameraStates(identity.camera_states || [])}
           </div>
           <details data-details-key="${esc(fieldsKey)}" ${openDetails.has(fieldsKey) ? "open" : ""}>
             <summary>Fields</summary>
             <div class="fields">${fieldRows(identity.fields)}</div>
           </details>
-          <div class="images">${latestImage(identity.media_links || [])}</div>
-          ${imageHistory(identity.key, identity.media_links || [])}
+          ${isPerson ? "" : `<div class="images">${latestImage(identity.media_links || [])}</div>`}
+          ${isPerson ? "" : imageHistory(identity.key, identity.media_links || [])}
         </article>
       `;
     }
@@ -725,18 +971,73 @@ INDEX_HTML = r"""
       }
     }
 
+    function scrollToIdentity(identityId) {
+      const cards = Array.from(document.querySelectorAll(".card[data-identity-id]"));
+      const target = cards.find(card => card.dataset.identityId === identityId);
+      if (!target) {
+        document.getElementById("updated").textContent = `not found: ${identityId}`;
+        return;
+      }
+
+      target.scrollIntoView({ behavior: "smooth", block: "center", inline: "nearest" });
+      target.classList.add("highlight");
+      setTimeout(() => target.classList.remove("highlight"), 1800);
+    }
+
+    function updateRefreshToggle() {
+      refreshToggle.textContent = updatesPaused ? "▶" : "⏸";
+      refreshToggle.title = updatesPaused ? "Resume updates" : "Pause updates";
+      refreshToggle.setAttribute("aria-label", updatesPaused ? "Resume updates" : "Pause updates");
+    }
+
+    function schedulePoll() {
+      if (pollTimer) {
+        clearTimeout(pollTimer);
+        pollTimer = null;
+      }
+      if (!updatesPaused) {
+        pollTimer = setTimeout(poll, pollMs);
+      }
+    }
+
     async function poll() {
+      if (updatesPaused) {
+        return;
+      }
       try {
         const response = await fetch("/api/state", { cache: "no-store" });
         render(await response.json());
       } catch (error) {
         document.getElementById("updated").textContent = `error: ${error}`;
       } finally {
-        setTimeout(poll, pollMs);
+        schedulePoll();
       }
     }
 
+    refreshToggle.addEventListener("click", () => {
+      updatesPaused = !updatesPaused;
+      updateRefreshToggle();
+      if (updatesPaused) {
+        if (pollTimer) {
+          clearTimeout(pollTimer);
+          pollTimer = null;
+        }
+        document.getElementById("updated").textContent += " (paused)";
+      } else {
+        poll();
+      }
+    });
+
+    updateRefreshToggle();
     poll();
+
+    document.addEventListener("click", event => {
+      const button = event.target.closest("[data-jump-identity]");
+      if (!button) {
+        return;
+      }
+      scrollToIdentity(button.getAttribute("data-jump-identity"));
+    });
 
     document.getElementById("clear-hot-state").addEventListener("click", async event => {
       const button = event.currentTarget;
@@ -746,13 +1047,21 @@ INDEX_HTML = r"""
       button.disabled = true;
       const previous = button.textContent;
       button.textContent = "Clearing...";
+      const deleteMedia = document.getElementById("delete-media").checked;
       try {
-        const response = await fetch("/api/admin/clear-hot-state", { method: "POST" });
+        const response = await fetch("/api/admin/clear-hot-state", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ delete_media: deleteMedia }),
+        });
         const result = await response.json();
         if (!response.ok) {
           throw new Error(result.detail || response.statusText);
         }
-        button.textContent = `Cleared ${result.deleted_keys} keys`;
+        const media = result.media || {};
+        button.textContent = deleteMedia
+          ? `Cleared ${result.deleted_keys} keys, ${media.deleted || 0} files`
+          : `Cleared ${result.deleted_keys} keys`;
         await fetch("/api/state", { cache: "no-store" }).then(resp => resp.json()).then(render);
         setTimeout(() => { button.textContent = previous; button.disabled = false; }, 1800);
       } catch (error) {
