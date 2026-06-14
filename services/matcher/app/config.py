@@ -38,6 +38,7 @@ class Settings:
     matcher_face_detection_quality_threshold: float = float(
         os.getenv("MATCHER_FACE_DETECTION_QUALITY_THRESHOLD", "0.60")
     )
+    matcher_unmatched_face_retry_seconds: float = float(os.getenv("MATCHER_UNMATCHED_FACE_RETRY_SECONDS", "0"))
     person_ttl_seconds: int = int(os.getenv("PERSON_TTL_SECONDS", "3600"))
 
     extraction_api_url: str = os.getenv("EXTRACTION_API_URL", "http://192.168.1.25:18666/v2")

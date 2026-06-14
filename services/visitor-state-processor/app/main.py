@@ -32,6 +32,15 @@ def configure_logging() -> None:
     logging.getLogger("redis").setLevel(logging.WARNING)
 
 
+def _float_or_none(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class VisitorStateProcessor:
     def __init__(
         self,
@@ -104,6 +113,7 @@ class VisitorStateProcessor:
                 detection_type,
                 resolution.is_new,
             )
+            camera_presence = await self._camera_presence_fields(resolution.identity.identity_id, payload.camera_id)
 
             identity_threshold = self._identity_threshold(detection_type)
             observed_ts = self._observed_timestamp(payload)
@@ -126,6 +136,11 @@ class VisitorStateProcessor:
                 camera_id=payload.camera_id,
                 event_timestamp=payload.event_timestamp,
                 event_epoch=observed_ts,
+                presence_total_seconds=_float_or_none(camera_presence.get("presence_total_seconds")),
+                first_seen_epoch=_float_or_none(camera_presence.get("first_seen_epoch")),
+                last_seen_epoch=_float_or_none(camera_presence.get("last_seen_epoch")),
+                first_seen_at=camera_presence.get("first_seen_at") or None,
+                last_seen_at=camera_presence.get("last_seen_at") or None,
                 track_id=payload.track_id,
                 bbox=payload.bbox,
                 age=extraction.age if extraction.age is not None else payload.age,
@@ -197,6 +212,27 @@ class VisitorStateProcessor:
         if detection_type == "face":
             return settings.face_embedding_field
         return settings.silhouette_embedding_field
+
+    async def _camera_presence_fields(self, identity_id: str, camera_id: str | None) -> dict[str, str]:
+        if not camera_id:
+            return {}
+        key = f"identity_camera:{identity_id}:{camera_id}"
+        fields = await self._hot_state_redis.hmget(
+            key,
+            "presence_total_seconds",
+            "first_seen_epoch",
+            "last_seen_epoch",
+            "first_seen_at",
+            "last_seen_at",
+        )
+        names = (
+            "presence_total_seconds",
+            "first_seen_epoch",
+            "last_seen_epoch",
+            "first_seen_at",
+            "last_seen_at",
+        )
+        return {name: value for name, value in zip(names, fields, strict=True) if value is not None}
 
     async def _update_hot_state(
         self,

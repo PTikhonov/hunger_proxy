@@ -160,6 +160,7 @@ class MatcherService:
         self._extraction_client = extraction_client
         self._http = httpx.AsyncClient(timeout=settings.extraction_timeout_seconds)
         self._pending_faces: dict[str, PendingFace] = {}
+        self._face_retry_after: dict[str, float] = {}
 
     async def aclose(self) -> None:
         await self._http.aclose()
@@ -193,6 +194,7 @@ class MatcherService:
                     observation.get("camera_id"),
                     observation.get("new_body"),
                 )
+                await self._upsert_silhouette_person(message_id, observation)
                 await self._index_silhouette_observation(message_id, observation)
                 await self._stream.ack(message_id)
                 return
@@ -202,12 +204,16 @@ class MatcherService:
                 await self._stream.ack(message_id)
                 return
 
-            if not _bool(observation.get("new_face") if "new_face" in observation else fields.get("new_face")):
+            is_new_face = _bool(observation.get("new_face") if "new_face" in observation else fields.get("new_face"))
+            should_match_face, skip_reason = await self._should_match_face_observation(observation, is_new_face)
+            if not should_match_face:
                 logger.debug(
-                    "Skipping face observation because new_face=false message_id=%s identity_id=%s camera_id=%s",
+                    "Skipping face observation reason=%s message_id=%s identity_id=%s camera_id=%s new_face=%s",
+                    skip_reason,
                     message_id,
                     observation.get("identity_id"),
                     observation.get("camera_id"),
+                    is_new_face,
                 )
                 await self._stream.ack(message_id)
                 return
@@ -232,12 +238,13 @@ class MatcherService:
                 ready_at=time() + settings.matcher_lookahead_seconds,
             )
             logger.debug(
-                "Queued new face for matching message_id=%s identity_id=%s camera_id=%s event_epoch=%s ready_in_seconds=%s",
+                "Queued face for matching message_id=%s identity_id=%s camera_id=%s event_epoch=%s ready_in_seconds=%s new_face=%s",
                 message_id,
                 observation.get("identity_id"),
                 observation.get("camera_id"),
                 event_epoch,
                 settings.matcher_lookahead_seconds,
+                is_new_face,
             )
         except Exception:
             logger.exception("Failed to handle observation message_id=%s", message_id)
@@ -250,6 +257,122 @@ class MatcherService:
         if not isinstance(parsed, dict):
             raise ValueError("Observation payload must be an object")
         return parsed
+
+    async def _should_match_face_observation(self, observation: dict[str, Any], is_new_face: bool) -> tuple[bool, str]:
+        if is_new_face:
+            return True, "new_face"
+
+        face_identity_id = str(observation.get("identity_id") or "")
+        if not face_identity_id:
+            return False, "missing_identity_id"
+
+        if self._has_pending_face_identity(face_identity_id):
+            return False, "already_pending"
+
+        identity_fields = await self._hot_state_redis.hgetall(f"identity:{face_identity_id}")
+        person_id = str(identity_fields.get("person_id") or "")
+        if person_id and await self._hot_state_redis.exists(person_id):
+            return False, "already_linked_to_live_person"
+
+        now = time()
+        retry_after = self._face_retry_after.get(face_identity_id, 0.0)
+        if retry_after > now:
+            return False, "retry_cooldown"
+
+        self._face_retry_after[face_identity_id] = now + settings.matcher_unmatched_face_retry_seconds
+        return True, "unmatched_existing_face"
+
+    def _has_pending_face_identity(self, face_identity_id: str) -> bool:
+        return any(
+            str(pending.observation.get("identity_id") or "") == face_identity_id
+            for pending in self._pending_faces.values()
+        )
+
+    async def _upsert_silhouette_person(self, message_id: str, observation: dict[str, Any]) -> str | None:
+        silhouette_identity_id = str(observation.get("identity_id") or "")
+        camera_id = str(observation.get("camera_id") or "")
+        if not silhouette_identity_id or not camera_id:
+            return None
+
+        identity_key = f"identity:{silhouette_identity_id}"
+        identity_fields = await self._hot_state_redis.hgetall(identity_key)
+        person_id = str(identity_fields.get("person_id") or "")
+
+        now = datetime.now(timezone.utc).isoformat()
+        person_created = False
+        if not person_id:
+            person_id = f"person:{uuid4()}"
+            person_created = True
+
+        person_key = person_id
+        person_fields = await self._hot_state_redis.hgetall(person_key)
+        silhouette_identity_ids = _append_unique(
+            _json_string_list(person_fields.get("silhouette_identity_ids")),
+            person_fields.get("silhouette_identity_id"),
+            person_fields.get("primary_silhouette_identity_id"),
+            person_fields.get("last_silhouette_identity_id"),
+            silhouette_identity_id,
+        )
+        camera_ids = _append_unique(
+            _json_string_list(person_fields.get("camera_ids")),
+            person_fields.get("camera_id"),
+            camera_id,
+        )
+        silhouette_camera_states = _updated_camera_states(
+            person_fields.get("silhouette_camera_states"),
+            camera_id,
+            silhouette_identity_id,
+            message_id,
+            observation,
+            now,
+        )
+
+        first_seen_epoch = _min_optional_number(
+            _float_or_none(person_fields.get("first_seen_epoch")),
+            _float_or_none(observation.get("first_seen_epoch")),
+        )
+        last_seen_epoch = _max_optional_number(
+            _float_or_none(person_fields.get("last_seen_epoch")),
+            _float_or_none(observation.get("last_seen_epoch")),
+        )
+        person_mapping = {
+            "person_id": person_id,
+            "person_source": person_fields.get("person_source") or "silhouette",
+            "match_status": person_fields.get("match_status") or "silhouette_only",
+            "silhouette_identity_id": silhouette_identity_ids[0],
+            "primary_silhouette_identity_id": silhouette_identity_ids[0],
+            "last_silhouette_identity_id": silhouette_identity_id,
+            "silhouette_identity_ids": json.dumps(silhouette_identity_ids, ensure_ascii=True),
+            "camera_id": camera_id,
+            "camera_ids": json.dumps(camera_ids, ensure_ascii=True),
+            "silhouette_camera_states": json.dumps(silhouette_camera_states, ensure_ascii=True),
+            "last_silhouette_observation_id": message_id,
+            "last_body_observation_id": message_id,
+            "last_body_source_event_id": str(observation.get("source_event_id") or ""),
+            "updated_at": now,
+            "last_seen_at": str(observation.get("last_seen_at") or now),
+        }
+        if first_seen_epoch is not None:
+            person_mapping["first_seen_epoch"] = str(first_seen_epoch)
+        if last_seen_epoch is not None:
+            person_mapping["last_seen_epoch"] = str(last_seen_epoch)
+        if not person_fields:
+            person_mapping["created_at"] = now
+            person_mapping["linked_at"] = now
+            person_mapping["first_seen_at"] = str(observation.get("first_seen_at") or now)
+
+        await self._hot_state_redis.hset(identity_key, mapping={"person_id": person_id, "person_matched_at": now})
+        await self._hot_state_redis.hset(person_key, mapping=person_mapping)
+        await self._hot_state_redis.expire(person_key, settings.person_ttl_seconds)
+        if person_created:
+            logger.info(
+                "Created silhouette person person_id=%s silhouette_identity_id=%s camera_id=%s message_id=%s",
+                person_id,
+                silhouette_identity_id,
+                camera_id,
+                message_id,
+            )
+        return person_id
 
     async def _index_silhouette_observation(self, message_id: str, observation: dict[str, Any]) -> None:
         event_epoch = _event_epoch(observation)
@@ -487,6 +610,7 @@ class MatcherService:
         person_id, person_reason = _select_person_id(face_person_id, silhouette_person_id)
         person_key = person_id
         person_fields = await self._hot_state_redis.hgetall(person_key)
+        candidate_observation = _candidate_observation(candidate)
 
         face_identity_ids = _append_unique(
             _json_string_list(person_fields.get("face_identity_ids")),
@@ -507,6 +631,27 @@ class MatcherService:
             _json_string_list(silhouette_fields.get("matched_face_identity_ids")),
             silhouette_fields.get("matched_face_identity_id"),
             face_identity_id,
+        )
+        camera_ids = _append_unique(
+            _json_string_list(person_fields.get("camera_ids")),
+            person_fields.get("camera_id"),
+            camera_id,
+        )
+        face_camera_states = _updated_camera_states(
+            person_fields.get("face_camera_states"),
+            camera_id,
+            face_identity_id,
+            pending.message_id,
+            pending.observation,
+            now,
+        )
+        silhouette_camera_states = _updated_camera_states(
+            person_fields.get("silhouette_camera_states"),
+            str(candidate.get("camera_id") or camera_id),
+            silhouette_identity_id,
+            str(candidate.get("observation_id") or ""),
+            candidate_observation,
+            now,
         )
 
         if face_person_id and silhouette_person_id and face_person_id != silhouette_person_id:
@@ -548,6 +693,11 @@ class MatcherService:
             "face_identity_ids": json.dumps(face_identity_ids, ensure_ascii=True),
             "silhouette_identity_ids": json.dumps(silhouette_identity_ids, ensure_ascii=True),
             "camera_id": camera_id,
+            "camera_ids": json.dumps(camera_ids, ensure_ascii=True),
+            "face_camera_states": json.dumps(face_camera_states, ensure_ascii=True),
+            "silhouette_camera_states": json.dumps(silhouette_camera_states, ensure_ascii=True),
+            "person_source": "matched",
+            "match_status": "matched",
             "linked_at": person_fields.get("linked_at") or now,
             "updated_at": now,
             "match_confidence": str(similarity),
@@ -648,6 +798,83 @@ def _append_unique(values: list[str], *items: str | None) -> list[str]:
         seen.add(normalized)
         result.append(normalized)
     return result
+
+
+def _json_dict(value: str | None) -> dict[str, Any]:
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _float_or_none(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _min_optional_number(left: float | None, right: float | None) -> float | None:
+    values = [value for value in (left, right) if value is not None]
+    return min(values) if values else None
+
+
+def _max_optional_number(left: float | None, right: float | None) -> float | None:
+    values = [value for value in (left, right) if value is not None]
+    return max(values) if values else None
+
+
+def _updated_camera_states(
+    existing_raw: str | None,
+    camera_id: str,
+    identity_id: str,
+    observation_id: str,
+    observation: dict[str, Any],
+    updated_at: str,
+) -> dict[str, Any]:
+    states = _json_dict(existing_raw)
+    previous = states.get(camera_id)
+    if not isinstance(previous, dict):
+        previous = {}
+
+    state = dict(previous)
+    state.update(
+        {
+            "camera_id": camera_id,
+            "identity_id": identity_id,
+            "observation_id": observation_id,
+            "source_event_id": str(observation.get("source_event_id") or ""),
+            "updated_at": updated_at,
+        }
+    )
+    for field in (
+        "presence_total_seconds",
+        "first_seen_epoch",
+        "last_seen_epoch",
+        "first_seen_at",
+        "last_seen_at",
+    ):
+        value = observation.get(field)
+        if value is not None and value != "":
+            state[field] = value
+    states[camera_id] = state
+    return states
+
+
+def _candidate_observation(candidate: dict[str, str]) -> dict[str, Any]:
+    payload = candidate.get("payload")
+    if not payload:
+        return {}
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def _embedding_from_observation(observation: dict[str, Any]) -> list[float]:

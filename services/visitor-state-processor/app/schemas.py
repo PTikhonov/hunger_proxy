@@ -59,6 +59,11 @@ class IdentityObservation(BaseModel):
     camera_id: str | None = None
     event_timestamp: str | None = None
     event_epoch: float | None = None
+    presence_total_seconds: float | None = None
+    first_seen_epoch: float | None = None
+    last_seen_epoch: float | None = None
+    first_seen_at: str | None = None
+    last_seen_at: str | None = None
     track_id: str | None = None
     bbox: Any | None = None
     age: int | float | None = None

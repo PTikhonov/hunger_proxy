@@ -68,7 +68,11 @@ async def state() -> dict[str, Any]:
     for identity in identities:
         camera_states = cameras_by_identity.get(identity["identity_id"], [])
         camera_states.sort(key=lambda item: item.get("last_seen_epoch_sort", 0.0), reverse=True)
-        identity["camera_states"] = camera_states
+        if identity.get("detection_type") == "person":
+            linked_camera_states = _linked_person_camera_states(identity, cameras_by_identity)
+            identity["camera_states"] = _merge_camera_states(identity.get("camera_states", []), linked_camera_states)
+        elif camera_states or not identity.get("camera_states"):
+            identity["camera_states"] = camera_states
 
     identities.sort(key=lambda item: item.get("first_seen_epoch_sort", 0.0))
     return {
@@ -193,14 +197,14 @@ def _person_from_hash(key: str, fields: dict[str, str], ttl_seconds: int) -> dic
         "person_id": fields.get("person_id") or key,
         "ttl_seconds": ttl_seconds,
         "ttl_display": _ttl_display(ttl_seconds),
-        "duration_seconds": 0.0,
-        "duration_display": "0.0s",
-        "not_seen_seconds": 0.0,
-        "not_seen_display": "0.0s",
+        "duration_seconds": _identity_duration_seconds(fields),
+        "duration_display": _identity_duration_display(fields),
+        "not_seen_seconds": _not_seen_seconds(fields),
+        "not_seen_display": _not_seen_display(fields),
         "first_seen_epoch_sort": sort_epoch,
         "last_seen_epoch_sort": sort_epoch,
         "media_links": [],
-        "camera_states": [],
+        "camera_states": _person_camera_states(fields, ttl_seconds),
         "fields": _display_fields(fields),
         "linked_face_identity_id": face_identity_ids[0] if face_identity_ids else "",
         "linked_silhouette_identity_id": silhouette_identity_ids[0] if silhouette_identity_ids else "",
@@ -208,6 +212,7 @@ def _person_from_hash(key: str, fields: dict[str, str], ttl_seconds: int) -> dic
         "linked_silhouette_identity_ids": silhouette_identity_ids,
         "linked_at": _format_iso(linked_at),
         "match_confidence": fields.get("match_confidence") or "",
+        "match_status": fields.get("match_status") or "",
     }
 
 
@@ -257,6 +262,76 @@ def _camera_state_from_hash(key: str, fields: dict[str, str], ttl_seconds: int) 
     }
 
 
+def _person_camera_states(fields: dict[str, str], ttl_seconds: int) -> list[dict[str, Any]]:
+    states: list[dict[str, Any]] = []
+    for state_type, raw in (
+        ("face", fields.get("face_camera_states")),
+        ("silhouette", fields.get("silhouette_camera_states")),
+    ):
+        parsed = _json_dict(raw)
+        for camera_id, state_fields in parsed.items():
+            if not isinstance(state_fields, dict):
+                continue
+            normalized = {str(key): str(value) for key, value in state_fields.items() if value is not None}
+            normalized.setdefault("camera_id", str(camera_id))
+            states.append(
+                {
+                    "key": f"person_camera:{fields.get('person_id') or ''}:{state_type}:{camera_id}",
+                    "identity_id": normalized.get("identity_id") or "",
+                    "camera_id": normalized.get("camera_id") or str(camera_id),
+                    "state_type": state_type,
+                    "ttl_seconds": ttl_seconds,
+                    "ttl_display": _ttl_display(ttl_seconds),
+                    "presence_total_seconds": _float_or_zero(normalized.get("presence_total_seconds")),
+                    "presence_total_display": _seconds_display(_float_or_zero(normalized.get("presence_total_seconds"))),
+                    "duration_seconds": _identity_duration_seconds(normalized),
+                    "duration_display": _identity_duration_display(normalized),
+                    "not_seen_seconds": _not_seen_seconds(normalized),
+                    "not_seen_display": _not_seen_display(normalized),
+                    "last_seen_epoch_sort": _float_or_zero(normalized.get("last_seen_epoch")),
+                    "fields": _display_fields(normalized),
+                }
+            )
+    states.sort(key=lambda item: item.get("last_seen_epoch_sort", 0.0), reverse=True)
+    return states
+
+
+def _linked_person_camera_states(
+    identity: dict[str, Any],
+    cameras_by_identity: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    states: list[dict[str, Any]] = []
+    for state_type, identity_ids in (
+        ("face", identity.get("linked_face_identity_ids") or []),
+        ("silhouette", identity.get("linked_silhouette_identity_ids") or []),
+    ):
+        for identity_id in identity_ids:
+            for camera_state in cameras_by_identity.get(str(identity_id), []):
+                state = dict(camera_state)
+                state["state_type"] = state_type
+                states.append(state)
+    return states
+
+
+def _merge_camera_states(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for group in groups:
+        for state in group:
+            key = (
+                str(state.get("state_type") or ""),
+                str(state.get("identity_id") or ""),
+                str(state.get("camera_id") or ""),
+            )
+            current = merged.get(key)
+            if current is None or _float_or_zero(state.get("last_seen_epoch_sort")) >= _float_or_zero(
+                current.get("last_seen_epoch_sort")
+            ):
+                merged[key] = state
+    values = list(merged.values())
+    values.sort(key=lambda item: item.get("last_seen_epoch_sort", 0.0), reverse=True)
+    return values
+
+
 def _identity_id_from_camera_key(key: str) -> str:
     parts = key.split(":")
     return parts[1] if len(parts) >= 3 else ""
@@ -289,6 +364,16 @@ def _json_string_list(value: str | None) -> list[str]:
     if not isinstance(parsed, list):
         return []
     return [str(item) for item in parsed if str(item)]
+
+
+def _json_dict(value: str | None) -> dict[str, Any]:
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def _append_unique_strings(values: list[str], *items: str | None) -> list[str]:
@@ -888,7 +973,7 @@ INDEX_HTML = r"""
         <div class="camera-states">
           ${cameras.map(camera => `
             <div class="camera-row">
-              <div class="camera-id">${esc(camera.camera_id || "")}</div>
+              <div class="camera-id">${camera.state_type ? esc(camera.state_type) + " | " : ""}${esc(camera.camera_id || "")}</div>
               <div class="camera-metrics">
                 presence ${esc(camera.presence_total_display || "0.0s")} |
                 duration ${esc(camera.duration_display || "0.0s")} |
@@ -934,7 +1019,7 @@ INDEX_HTML = r"""
             <div class="meta">TTL ${esc(identity.ttl_display || "")} | duration ${esc(identity.duration_display || "0.0s")} | not seen ${esc(identity.not_seen_display || "0.0s")}</div>
             <div class="meta">${esc(identity.detection_type)} ${identity.person_id ? "-> " + esc(identity.person_id) : ""}</div>
             ${personMeta(identity)}
-            ${isPerson ? "" : cameraStates(identity.camera_states || [])}
+            ${cameraStates(identity.camera_states || [])}
           </div>
           <details data-details-key="${esc(fieldsKey)}" ${openDetails.has(fieldsKey) ? "open" : ""}>
             <summary>Fields</summary>
