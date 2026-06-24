@@ -240,7 +240,7 @@ async def ingest(request: Request) -> dict[str, str]:
     }
 
 
-@app.post("/video-detector/frame", status_code=status.HTTP_202_ACCEPTED)
+@app.post("/video-detector/frame", status_code=status.HTTP_200_OK)
 async def post_detection(request: Request) -> dict[str, str]:
     return await ingest(request)
 
