@@ -3,7 +3,7 @@ services:
     image: redis:7.2-alpine
     command: redis-server --appendonly yes
     ports:
-      - "6381:6379"
+      - "6379:6379"
     volumes:
       - redis-streams-data:/data
     healthcheck:
@@ -42,7 +42,7 @@ services:
       MEDIA_URL_BASE: ${MEDIA_URL_BASE:-http://192.168.1.25:3333/uploads}
       LOG_LEVEL: ${LOG_LEVEL:-DEBUG}
     ports:
-      - "8001:8000"
+      - "8000:8000"
     depends_on:
       redis-streams:
         condition: service_healthy
