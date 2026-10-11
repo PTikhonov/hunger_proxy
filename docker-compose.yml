@@ -1,6 +1,7 @@
 services:
   redis-streams:
     image: redis:7.2-alpine
+    restart: unless-stopped
     command: redis-server --appendonly yes
     ports:
       - "6381:6379"
@@ -14,6 +15,7 @@ services:
 
   redis-hot-state:
     image: redis:7.2-alpine
+    restart: unless-stopped
     command: redis-server --appendonly yes
     ports:
       - "6380:6379"
@@ -25,9 +27,32 @@ services:
       timeout: 3s
       retries: 10
 
+  hunger-proxy-api:
+    build:
+      context: ./services/hunger-proxy-api
+    restart: unless-stopped
+    environment:
+      APP_NAME: hunger-proxy-api
+      REDIS_GEOMETRY_URL: redis://redis-hot-state:6379/1
+      GEOMETRY_KEY_PREFIX: hunger:geometry:camera
+      GEOMETRY_CAMERA_INDEX: hunger:geometry:cameras
+      GEOMETRY_CHANGED_CHANNEL: hunger:geometry:changed
+      HUNGER_PROXY_API_TOKEN: ${HUNGER_PROXY_API_TOKEN:-}
+    ports:
+      - "8008:8008"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8008/ready', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    depends_on:
+      redis-hot-state:
+        condition: service_healthy
+
   ingest-server:
     build:
       context: ./services/ingest-server
+    restart: unless-stopped
     environment:
       APP_NAME: ingest-server
       REDIS_URL: redis://redis-streams:6379/0
@@ -50,6 +75,7 @@ services:
   media-uploader:
     build:
       context: ./services/media-uploader
+    restart: unless-stopped
     environment:
       APP_NAME: media-uploader
       REDIS_URL: redis://redis-streams:6379/0
@@ -68,6 +94,7 @@ services:
   visitor-state-processor:
     build:
       context: ./services/visitor-state-processor
+    restart: unless-stopped
     environment:
       APP_NAME: visitor-state-processor
       REDIS_STREAM_URL: redis://redis-streams:6379/0
@@ -111,6 +138,7 @@ services:
   matcher:
     build:
       context: ./services/matcher
+    restart: unless-stopped
     environment:
       APP_NAME: matcher
       REDIS_STREAM_URL: redis://redis-streams:6379/0
@@ -141,9 +169,49 @@ services:
       redis-hot-state:
         condition: service_healthy
 
+  interest-watcher:
+    build:
+      context: ./services/interest-watcher
+    restart: unless-stopped
+    environment:
+      APP_NAME: interest-watcher
+      REDIS_STREAM_URL: redis://redis-streams:6379/0
+      REDIS_HOT_STATE_URL: redis://redis-hot-state:6379/0
+      REDIS_GEOMETRY_URL: redis://redis-hot-state:6379/1
+      IDENTITY_OBSERVATIONS_STREAM: stream:identity-observations
+      IDENTITY_OBSERVATIONS_CONSUMER_GROUP: interest-watcher
+      INTEREST_BATCH_SIZE: ${INTEREST_BATCH_SIZE:-10}
+      INTEREST_BLOCK_MS: ${INTEREST_BLOCK_MS:-5000}
+      INTEREST_PENDING_IDLE_MS: ${INTEREST_PENDING_IDLE_MS:-30000}
+      INTEREST_DEAD_LETTER_STREAM: ${INTEREST_DEAD_LETTER_STREAM:-stream:interest-watcher-dead-letter}
+      INTEREST_DEAD_LETTER_MAXLEN: ${INTEREST_DEAD_LETTER_MAXLEN:-10000}
+      INTEREST_GAP_SECONDS: ${INTEREST_GAP_SECONDS:-10}
+      INTEREST_MISSES_BEFORE_RESET: ${INTEREST_MISSES_BEFORE_RESET:-3}
+      PERSON_RESOLVE_TIMEOUT_SECONDS: ${PERSON_RESOLVE_TIMEOUT_SECONDS:-3}
+      PERSON_RESOLVE_INTERVAL_SECONDS: ${PERSON_RESOLVE_INTERVAL_SECONDS:-0.1}
+      PERSON_TTL_SECONDS: ${PERSON_TTL_SECONDS:-3600}
+      EXTRACTION_API_URL: ${EXTRACTION_API_URL:-http://192.168.1.25:18666/v2}
+      EXTRACTION_TIMEOUT_SECONDS: ${EXTRACTION_TIMEOUT_SECONDS:-5}
+      MEDIA_DOWNLOAD_TIMEOUT_SECONDS: ${MEDIA_DOWNLOAD_TIMEOUT_SECONDS:-5}
+      EXTRACTION_IMAGE_FIELD: ${EXTRACTION_IMAGE_FIELD:-sample}
+      HEAD_DETECTOR: ${HEAD_DETECTOR:-head}
+      HEAD_POSE_ATTRIBUTE: ${HEAD_POSE_ATTRIBUTE:-head_headpose_unconstrained}
+      HEAD_HEIGHT_METERS: ${HEAD_HEIGHT_METERS:-0.25}
+      MIN_HEAD_SIZE: ${MIN_HEAD_SIZE:-30}
+      MAX_HEAD_WIDTH_TO_HEIGHT_RATE: ${MAX_HEAD_WIDTH_TO_HEIGHT_RATE:-1}
+      MAX_HEAD_HEIGHT_TO_BODY_HEIGHT: ${MAX_HEAD_HEIGHT_TO_BODY_HEIGHT:-0.5}
+      MAX_HEAD_TO_BODY_PROPORTION: ${MAX_HEAD_TO_BODY_PROPORTION:-0.5}
+      LOG_LEVEL: ${LOG_LEVEL:-DEBUG}
+    depends_on:
+      redis-streams:
+        condition: service_healthy
+      redis-hot-state:
+        condition: service_healthy
+
   state-visualizer:
     build:
       context: ./services/state-visualizer
+    restart: unless-stopped
     environment:
       APP_NAME: state-visualizer
       REDIS_HOT_STATE_URL: redis://redis-hot-state:6379/0

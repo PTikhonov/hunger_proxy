@@ -205,6 +205,7 @@ def _person_from_hash(key: str, fields: dict[str, str], ttl_seconds: int) -> dic
         "last_seen_epoch_sort": sort_epoch,
         "media_links": [],
         "camera_states": _person_camera_states(fields, ttl_seconds),
+        "interests": _interests_from_fields(fields),
         "fields": _display_fields(fields),
         "linked_face_identity_id": face_identity_ids[0] if face_identity_ids else "",
         "linked_silhouette_identity_id": silhouette_identity_ids[0] if silhouette_identity_ids else "",
@@ -412,8 +413,33 @@ def _display_fields(fields: dict[str, str]) -> dict[str, str]:
     return {
         key: _display_value(key, value)
         for key, value in fields.items()
-        if key not in hidden
+        if key not in hidden and not key.startswith("interest:")
     }
+
+
+def _interests_from_fields(fields: dict[str, str]) -> list[dict[str, Any]]:
+    interests: list[dict[str, Any]] = []
+    suffix = ":total_seconds"
+    for field, value in fields.items():
+        if not field.startswith("interest:") or not field.endswith(suffix):
+            continue
+        prefix = field.removesuffix(suffix)
+        detail = _json_dict(fields.get(f"{prefix}:detail"))
+        total = _float_or_zero(value)
+        interests.append(
+            {
+                "camera_id": str(detail.get("camera_id") or ""),
+                "shelf_id": str(detail.get("shelf_id") or ""),
+                "shelf_name": str(detail.get("shelf_name") or ""),
+                "category_id": str(detail.get("category_id") or ""),
+                "intersects": str(fields.get(f"{prefix}:intersects") or "false").lower() == "true",
+                "total_seconds": total,
+                "total_display": _seconds_display(total),
+                "updated_at": _format_iso(str(fields.get(f"{prefix}:updated_at") or "")),
+            }
+        )
+    interests.sort(key=lambda item: (item["camera_id"], item["shelf_id"]))
+    return interests
 
 
 def _display_value(key: str, value: str) -> str:
@@ -999,6 +1025,22 @@ INDEX_HTML = r"""
       `;
     }
 
+    function interests(items) {
+      if (!items || !items.length) return "";
+      return `
+        <div class="camera-states">
+          ${items.map(item => `
+            <div class="camera-row">
+              <div class="camera-id">${item.intersects ? "👁 " : ""}shelf ${esc(item.shelf_name || item.shelf_id)} | camera ${esc(item.camera_id)}</div>
+              <div class="camera-metrics">
+                interest ${esc(item.total_display)}${item.category_id ? " | category " + esc(item.category_id) : ""}
+              </div>
+            </div>
+          `).join("")}
+        </div>
+      `;
+    }
+
     function identityLinks(identityIds) {
       return (identityIds || [])
         .filter(Boolean)
@@ -1019,6 +1061,7 @@ INDEX_HTML = r"""
             <div class="meta">TTL ${esc(identity.ttl_display || "")} | duration ${esc(identity.duration_display || "0.0s")} | not seen ${esc(identity.not_seen_display || "0.0s")}</div>
             <div class="meta">${esc(identity.detection_type)} ${identity.person_id ? "-> " + esc(identity.person_id) : ""}</div>
             ${personMeta(identity)}
+            ${interests(identity.interests || [])}
             ${cameraStates(identity.camera_states || [])}
           </div>
           <details data-details-key="${esc(fieldsKey)}" ${openDetails.has(fieldsKey) ? "open" : ""}>
