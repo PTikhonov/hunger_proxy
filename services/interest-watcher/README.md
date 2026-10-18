@@ -34,7 +34,7 @@ Multiple heads from the same Extraction API response are filtered without additi
 calls. A candidate is discarded when either side is less than `MIN_HEAD_SIZE` (default `30`
 pixels), `head_width / head_height` is greater than `MAX_HEAD_WIDTH_TO_HEIGHT_RATE` (default
 `1`), `head_height / body_height` is greater than `MAX_HEAD_HEIGHT_TO_BODY_HEIGHT` (default
-`0.5`), or `head_bbox_area / silhouette_crop_area` is greater than
+`0.7`), or `head_bbox_area / silhouette_crop_area` is greater than
 `MAX_HEAD_TO_BODY_PROPORTION` (default `0.5`). The highest-score remaining candidate is used.
 
 The normalized image must be an exact, unscaled crop. Therefore:
@@ -53,3 +53,9 @@ New geometry should send `viewing_direction`. Existing geometry remains supporte
 the mapping `side=A -> normal`, `side=B -> opposite`, `side=AB -> both`. For a one-sided
 shelf, interest is counted when the gaze approaches from the side opposite to the arrow
 shown in hunger_head. `AB` continues to allow both directions.
+
+For every successfully processed silhouette observation, the worker stores a temporary
+`gaze_annotation:<source_event_id>` JSON value in Redis Hot State. It contains the
+full-frame head bbox, estimated head distance, gaze vector, geometry revision, and shelf
+polygons already projected to full-frame pixel coordinates. Its TTL matches
+`PERSON_TTL_SECONDS`.

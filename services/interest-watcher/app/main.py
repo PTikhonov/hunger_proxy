@@ -14,7 +14,7 @@ from redis.exceptions import ResponseError
 
 from app.config import settings
 from app.extraction import ExtractionClient, HeadNotDetectedError
-from app.geometry import gaze_vector, head_point, ray_intersects_shelf
+from app.geometry import gaze_vector, head_point, project_direction, project_point, ray_intersects_shelf
 
 
 logger = logging.getLogger(settings.app_name)
@@ -162,6 +162,7 @@ class InterestWatcher:
         direction = gaze_vector(pose["yaw"], pose["pitch"], pose["roll"])
         observed_epoch = _event_epoch(observation)
         hits: list[str] = []
+        shelf_annotations: list[dict[str, Any]] = []
         for shelf in geometry.get("shelves") or []:
             shelf_id = str(shelf["shelf_id"])
             intersects, point = ray_intersects_shelf(
@@ -172,13 +173,83 @@ class InterestWatcher:
             )
             if intersects:
                 hits.append(shelf_id)
+            shelf_annotations.append({
+                "shelf_id": shelf_id,
+                "name": shelf.get("name"),
+                "category_id": shelf.get("category_id"),
+                "category_2_id": shelf.get("category_2_id"),
+                "points_px": [_project_optional(geometry["camera"], item) for item in shelf["points"]],
+                "intersects": intersects,
+                "intersection_px": _project_optional(geometry["camera"], point),
+                "viewing_direction": _viewing_direction(shelf),
+            })
             await self._update_interest(
                 person_id, camera_id, shelf, observed_epoch, intersects,
                 {"source_event_id": observation.get("source_event_id"), "head_bbox": full_bbox,
                  "head_pose": pose, "head_point": origin, "gaze_vector": direction,
                  "intersection_point": point, "observation_stream_id": message_id},
             )
+        await self._store_gaze_annotation(
+            observation=observation,
+            message_id=message_id,
+            identity_id=identity_id,
+            person_id=person_id,
+            camera_id=camera_id,
+            geometry=geometry,
+            head_bbox=full_bbox,
+            head_pose=pose,
+            head_point_3d=origin,
+            gaze_direction=direction,
+            shelves=shelf_annotations,
+        )
         logger.info("Calculated interest person_id=%s camera_id=%s shelves=%s", person_id, camera_id, hits)
+
+    async def _store_gaze_annotation(
+        self,
+        *,
+        observation: dict[str, Any],
+        message_id: str,
+        identity_id: str,
+        person_id: str,
+        camera_id: str,
+        geometry: dict[str, Any],
+        head_bbox: list[float],
+        head_pose: dict[str, float],
+        head_point_3d: tuple[float, float, float],
+        gaze_direction: tuple[float, float, float],
+        shelves: list[dict[str, Any]],
+    ) -> None:
+        source_event_id = str(observation.get("source_event_id") or "")
+        if not source_event_id:
+            logger.warning("Cannot store gaze annotation without source_event_id message_id=%s", message_id)
+            return
+        camera = geometry["camera"]
+        payload = {
+            "schema_version": 1,
+            "source_event_id": source_event_id,
+            "identity_id": identity_id,
+            "person_id": person_id,
+            "camera_id": camera_id,
+            "geometry_revision": geometry.get("revision"),
+            "event_timestamp": observation.get("event_timestamp") or observation.get("observed_at"),
+            "event_epoch": observation.get("event_epoch"),
+            "observation_stream_id": message_id,
+            "frame_width": int(camera["frame_width"]),
+            "frame_height": int(camera["frame_height"]),
+            "head_bbox": head_bbox,
+            "head_pose": head_pose,
+            "head_point": head_point_3d,
+            "head_distance_m": head_point_3d[2],
+            "gaze_vector": gaze_direction,
+            "gaze_direction_px": project_direction(camera, gaze_direction),
+            "shelves": shelves,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        await self.hot.set(
+            f"gaze_annotation:{source_event_id}",
+            json.dumps(payload, ensure_ascii=True),
+            ex=settings.person_ttl_seconds,
+        )
 
     async def _camera_geometry(self, camera_id: str) -> dict[str, Any] | None:
         cache_key = f"hunger:geometry:camera:{camera_id}"
@@ -322,6 +393,15 @@ def _viewing_direction(shelf: dict[str, Any]) -> str:
     if "ab" in sides or {"a", "b"}.issubset(sides):
         return "both"
     return {"a": "normal", "b": "opposite"}.get(next(iter(sides), ""), "both")
+
+
+def _project_optional(camera: dict[str, Any], point: Any) -> list[float] | None:
+    if point is None:
+        return None
+    try:
+        return list(project_point(camera, point))
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 async def main() -> None:

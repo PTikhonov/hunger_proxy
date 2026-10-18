@@ -30,10 +30,10 @@ class Settings:
     extraction_image_field: str = os.getenv("EXTRACTION_IMAGE_FIELD", "sample")
     head_detector: str = os.getenv("HEAD_DETECTOR", "head")
     head_pose_attribute: str = os.getenv("HEAD_POSE_ATTRIBUTE", "head_headpose_unconstrained")
-    head_height_meters: float = float(os.getenv("HEAD_HEIGHT_METERS", "0.25"))
+    head_height_meters: float = float(os.getenv("HEAD_HEIGHT_METERS", "0.3"))
     min_head_size: int = int(os.getenv("MIN_HEAD_SIZE", "30"))
     max_head_width_to_height_rate: float = float(os.getenv("MAX_HEAD_WIDTH_TO_HEIGHT_RATE", "1"))
-    max_head_height_to_body_height: float = float(os.getenv("MAX_HEAD_HEIGHT_TO_BODY_HEIGHT", "0.5"))
+    max_head_height_to_body_height: float = float(os.getenv("MAX_HEAD_HEIGHT_TO_BODY_HEIGHT", "0.7"))
     max_head_to_body_proportion: float = float(os.getenv("MAX_HEAD_TO_BODY_PROPORTION", "0.5"))
     log_level: str = os.getenv("LOG_LEVEL", "INFO").upper()
 

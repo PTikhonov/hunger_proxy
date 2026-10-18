@@ -72,10 +72,43 @@ def head_point(camera: dict[str, Any], bbox: Sequence[float], head_height_meters
     z = head_height_meters * focal / object_height_on_sensor
     center_x = left + (right - left) / 2.0
     center_y = top + (bottom - top) / 2.0
-    # Deliberately no multiplication by z: this is the requested reference behavior.
-    x = (sensor_width * (center_x - frame_width / 2.0) / frame_width) / focal
-    y = (sensor_height * (center_y - frame_height / 2.0) / frame_height) / focal
+    x = z * (sensor_width * (center_x - frame_width / 2.0) / frame_width) / focal
+    y = z * (sensor_height * (center_y - frame_height / 2.0) / frame_height) / focal
     return x, y, z
+
+
+def project_point(camera: dict[str, Any], point: Sequence[float]) -> tuple[float, float]:
+    """Project a camera-coordinate 3D point to full-frame pixel coordinates."""
+    x, y, z = (float(value) for value in point)
+    if z <= EPSILON:
+        raise ValueError("point must be in front of the camera")
+    frame_width = float(camera["frame_width"])
+    frame_height = float(camera["frame_height"])
+    focal = float(camera["focal_length_in_mm"])
+    sensor_width = float(camera["sensor_width_in_mm"])
+    sensor_height = float(camera["sensor_height_in_mm"])
+    return (
+        frame_width / 2.0 + x * focal * frame_width / (z * sensor_width),
+        frame_height / 2.0 + y * focal * frame_height / (z * sensor_height),
+    )
+
+
+def project_direction(camera: dict[str, Any], direction: Sequence[float]) -> tuple[float, float]:
+    """Return the image-plane direction toward a ray's vanishing point."""
+    x, y, z = (float(value) for value in direction)
+    if abs(z) <= EPSILON:
+        # A side-looking ray has a vanishing point at infinity. Retain its
+        # screen direction and let the UI normalize the vector length.
+        z = EPSILON if z >= 0 else -EPSILON
+    frame_width = float(camera["frame_width"])
+    frame_height = float(camera["frame_height"])
+    focal = float(camera["focal_length_in_mm"])
+    sensor_width = float(camera["sensor_width_in_mm"])
+    sensor_height = float(camera["sensor_height_in_mm"])
+    return (
+        x * focal * frame_width / (z * sensor_width),
+        y * focal * frame_height / (z * sensor_height),
+    )
 
 
 def ray_intersects_shelf(

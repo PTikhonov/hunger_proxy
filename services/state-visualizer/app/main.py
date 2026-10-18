@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import httpx
-from fastapi import Body, FastAPI
+from fastapi import Body, FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from redis.asyncio import Redis
 
@@ -85,6 +85,21 @@ async def state() -> dict[str, Any]:
         },
         "identities": identities,
     }
+
+
+@app.get("/api/gaze-annotation/{source_event_id}")
+async def gaze_annotation(source_event_id: str) -> dict[str, Any]:
+    assert redis is not None
+    raw = await redis.get(f"gaze_annotation:{source_event_id}")
+    if not raw:
+        raise HTTPException(status_code=404, detail="gaze annotation not found")
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=500, detail="invalid gaze annotation") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=500, detail="invalid gaze annotation")
+    return payload
 
 
 @app.post("/api/admin/clear-hot-state")
@@ -831,6 +846,88 @@ INDEX_HTML = r"""
       gap: 3px;
     }
 
+    .gaze-modal {
+      position: fixed;
+      inset: 0;
+      z-index: 20;
+      display: none;
+      grid-template-rows: auto minmax(0, 1fr);
+      background: rgba(6, 12, 18, 0.9);
+      color: #ffffff;
+    }
+
+    .gaze-modal.open { display: grid; }
+
+    .gaze-modal-head {
+      min-width: 0;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 10px 14px;
+      background: rgba(12, 21, 29, 0.96);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.2);
+    }
+
+    .gaze-modal-meta {
+      min-width: 0;
+      display: grid;
+      gap: 3px;
+      font-size: 12px;
+      color: #d3dde5;
+      overflow-wrap: anywhere;
+    }
+
+    .gaze-modal-close {
+      flex: 0 0 auto;
+      width: 36px;
+      height: 36px;
+      border: 1px solid rgba(255, 255, 255, 0.35);
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.08);
+      color: #ffffff;
+      font-size: 22px;
+      cursor: pointer;
+    }
+
+    .gaze-modal-body {
+      min-width: 0;
+      min-height: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 14px;
+      overflow: auto;
+    }
+
+    .gaze-frame {
+      position: relative;
+      display: inline-block;
+      line-height: 0;
+      box-shadow: 0 3px 24px rgba(0, 0, 0, 0.5);
+    }
+
+    .gaze-frame img {
+      display: block;
+      width: auto;
+      height: auto;
+      max-width: calc(100vw - 28px);
+      max-height: calc(100vh - 92px);
+    }
+
+    .gaze-frame svg {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      pointer-events: none;
+    }
+
+    .overlay-stroke {
+      vector-effect: non-scaling-stroke;
+    }
+
     .empty {
       color: var(--muted);
       padding: 16px;
@@ -883,6 +980,22 @@ INDEX_HTML = r"""
     </section>
   </main>
 
+  <div class="gaze-modal" id="gaze-modal" role="dialog" aria-modal="true" aria-label="Full frame gaze overlay">
+    <div class="gaze-modal-head">
+      <div class="gaze-modal-meta">
+        <strong id="gaze-modal-event"></strong>
+        <span id="gaze-modal-status">loading annotation…</span>
+      </div>
+      <button class="gaze-modal-close" id="gaze-modal-close" type="button" aria-label="Close">×</button>
+    </div>
+    <div class="gaze-modal-body" id="gaze-modal-body">
+      <div class="gaze-frame">
+        <img id="gaze-full-frame" alt="full frame" />
+        <svg id="gaze-overlay" aria-hidden="true"></svg>
+      </div>
+    </div>
+  </div>
+
   <script>
     const lists = {
       silhouette: document.getElementById("silhouette-list"),
@@ -902,6 +1015,180 @@ INDEX_HTML = r"""
     let updatesPaused = false;
 
     const refreshToggle = document.getElementById("refresh-toggle");
+    const gazeModal = document.getElementById("gaze-modal");
+    const gazeModalBody = document.getElementById("gaze-modal-body");
+    const gazeModalEvent = document.getElementById("gaze-modal-event");
+    const gazeModalStatus = document.getElementById("gaze-modal-status");
+    const gazeFullFrame = document.getElementById("gaze-full-frame");
+    const gazeOverlay = document.getElementById("gaze-overlay");
+    const SVG_NS = "http://www.w3.org/2000/svg";
+    let gazeModalRequest = 0;
+    let activeGazeAnnotation = null;
+
+    function svgNode(name, attributes = {}) {
+      const node = document.createElementNS(SVG_NS, name);
+      for (const [key, value] of Object.entries(attributes)) {
+        node.setAttribute(key, String(value));
+      }
+      return node;
+    }
+
+    function numericPair(value) {
+      if (!Array.isArray(value) || value.length !== 2) return null;
+      const pair = value.map(Number);
+      return pair.every(Number.isFinite) ? pair : null;
+    }
+
+    function addOverlayText(x, y, value, color = "#ffffff", anchor = "start") {
+      const text = svgNode("text", {
+        x, y, fill: color, "font-size": 18, "font-family": "Arial, sans-serif",
+        "font-weight": 700, "text-anchor": anchor, stroke: "rgba(0, 0, 0, 0.9)",
+        "stroke-width": 4, "paint-order": "stroke", "stroke-linejoin": "round",
+        class: "overlay-stroke",
+      });
+      text.textContent = value;
+      gazeOverlay.appendChild(text);
+    }
+
+    function renderGazeOverlay(annotation) {
+      gazeOverlay.replaceChildren();
+      const width = Number(annotation.frame_width) || gazeFullFrame.naturalWidth;
+      const height = Number(annotation.frame_height) || gazeFullFrame.naturalHeight;
+      if (!(width > 0 && height > 0)) return;
+      gazeOverlay.setAttribute("viewBox", `0 0 ${width} ${height}`);
+      gazeOverlay.setAttribute("preserveAspectRatio", "none");
+
+      const defs = svgNode("defs");
+      const marker = svgNode("marker", {
+        id: "gaze-arrowhead", viewBox: "0 0 10 10", refX: 9, refY: 5,
+        markerWidth: 12, markerHeight: 12, orient: "auto", markerUnits: "userSpaceOnUse",
+      });
+      marker.appendChild(svgNode("path", { d: "M 0 0 L 10 5 L 0 10 z", fill: "#ffd43b" }));
+      defs.appendChild(marker);
+      gazeOverlay.appendChild(defs);
+
+      for (const shelf of annotation.shelves || []) {
+        const points = (shelf.points_px || []).map(numericPair).filter(Boolean);
+        if (points.length < 3) continue;
+        const hit = Boolean(shelf.intersects);
+        const color = hit ? "#51cf66" : "#38d9a9";
+        gazeOverlay.appendChild(svgNode("polygon", {
+          points: points.map(point => point.join(",")).join(" "),
+          fill: color, "fill-opacity": 0.18, stroke: color, "stroke-width": 3,
+          "stroke-linejoin": "round", class: "overlay-stroke",
+        }));
+        const centerX = points.reduce((total, point) => total + point[0], 0) / points.length;
+        const centerY = points.reduce((total, point) => total + point[1], 0) / points.length;
+        addOverlayText(centerX, centerY, `Shelf ${shelf.name || shelf.shelf_id || ""}`, color, "middle");
+
+        const intersection = numericPair(shelf.intersection_px);
+        if (intersection) {
+          gazeOverlay.appendChild(svgNode("circle", {
+            cx: intersection[0], cy: intersection[1], r: 7,
+            fill: hit ? "#51cf66" : "#ff6b6b", stroke: "#ffffff", "stroke-width": 2,
+            class: "overlay-stroke",
+          }));
+        }
+      }
+
+      const bbox = Array.isArray(annotation.head_bbox) ? annotation.head_bbox.map(Number) : [];
+      if (bbox.length !== 4 || !bbox.every(Number.isFinite)) return;
+      const [left, top, right, bottom] = bbox;
+      gazeOverlay.appendChild(svgNode("rect", {
+        x: left, y: top, width: Math.max(0, right - left), height: Math.max(0, bottom - top),
+        fill: "none", stroke: "#ffd43b", "stroke-width": 3, class: "overlay-stroke",
+      }));
+
+      const startX = left + (right - left) / 2;
+      const startY = top + (bottom - top) / 2;
+      const direction = numericPair(annotation.gaze_direction_px);
+      if (direction) {
+        const magnitude = Math.hypot(direction[0], direction[1]);
+        if (magnitude > 1e-6) {
+          const unitX = direction[0] / magnitude;
+          const unitY = direction[1] / magnitude;
+          let length = Math.min(width, height) * 0.22;
+          const limits = [];
+          if (unitX > 0) limits.push((width - startX) / unitX);
+          if (unitX < 0) limits.push((0 - startX) / unitX);
+          if (unitY > 0) limits.push((height - startY) / unitY);
+          if (unitY < 0) limits.push((0 - startY) / unitY);
+          if (limits.length) length = Math.max(0, Math.min(length, Math.min(...limits) - 4));
+          gazeOverlay.appendChild(svgNode("line", {
+            x1: startX, y1: startY, x2: startX + unitX * length, y2: startY + unitY * length,
+            stroke: "#ffd43b", "stroke-width": 4, "marker-end": "url(#gaze-arrowhead)",
+            class: "overlay-stroke",
+          }));
+        }
+      }
+
+      const distance = Number(annotation.head_distance_m);
+      if (Number.isFinite(distance)) {
+        const labelY = top >= 26 ? top - 9 : Math.min(height - 8, bottom + 23);
+        addOverlayText(Math.max(8, left), labelY, `Head distance ${distance.toFixed(2)} m`, "#ffd43b");
+      }
+    }
+
+    function updateGazeModalStatus(annotation) {
+      const dimensions = `${annotation.frame_width || "?"}×${annotation.frame_height || "?"}`;
+      const distance = Number(annotation.head_distance_m);
+      const distanceText = Number.isFinite(distance) ? ` | head distance ${distance.toFixed(2)} m` : "";
+      const mismatch = gazeFullFrame.naturalWidth && gazeFullFrame.naturalHeight &&
+        (Number(annotation.frame_width) !== gazeFullFrame.naturalWidth || Number(annotation.frame_height) !== gazeFullFrame.naturalHeight)
+        ? ` | image ${gazeFullFrame.naturalWidth}×${gazeFullFrame.naturalHeight}` : "";
+      gazeModalStatus.textContent = `camera ${annotation.camera_id || ""} | geometry revision ${annotation.geometry_revision ?? "?"} | frame ${dimensions}${distanceText}${mismatch}`;
+    }
+
+    async function openGazeModal(sourceEventId, fullFrameUrl) {
+      const requestId = ++gazeModalRequest;
+      activeGazeAnnotation = null;
+      gazeOverlay.replaceChildren();
+      gazeModalEvent.textContent = sourceEventId || fullFrameUrl;
+      gazeModalStatus.textContent = "loading annotation…";
+      gazeModal.classList.add("open");
+      document.body.style.overflow = "hidden";
+      gazeFullFrame.onload = () => {
+        if (requestId !== gazeModalRequest) return;
+        if (activeGazeAnnotation) {
+          renderGazeOverlay(activeGazeAnnotation);
+          updateGazeModalStatus(activeGazeAnnotation);
+        }
+      };
+      gazeFullFrame.onerror = () => {
+        if (requestId === gazeModalRequest) gazeModalStatus.textContent = "failed to load full frame";
+      };
+      gazeFullFrame.src = fullFrameUrl;
+
+      if (!sourceEventId) {
+        gazeModalStatus.textContent = "gaze annotation unavailable: source_event_id is absent";
+        return;
+      }
+      try {
+        const response = await fetch(`/api/gaze-annotation/${encodeURIComponent(sourceEventId)}`, { cache: "no-store" });
+        if (!response.ok) {
+          const message = response.status === 404 ? "gaze annotation is not available for this frame" : `annotation error ${response.status}`;
+          throw new Error(message);
+        }
+        const annotation = await response.json();
+        if (requestId !== gazeModalRequest) return;
+        activeGazeAnnotation = annotation;
+        if (gazeFullFrame.complete && gazeFullFrame.naturalWidth) {
+          renderGazeOverlay(annotation);
+          updateGazeModalStatus(annotation);
+        }
+      } catch (error) {
+        if (requestId === gazeModalRequest) gazeModalStatus.textContent = String(error.message || error);
+      }
+    }
+
+    function closeGazeModal() {
+      gazeModalRequest += 1;
+      activeGazeAnnotation = null;
+      gazeModal.classList.remove("open");
+      gazeOverlay.replaceChildren();
+      gazeFullFrame.removeAttribute("src");
+      document.body.style.overflow = "";
+    }
 
     function esc(value) {
       return String(value ?? "").replace(/[&<>"']/g, ch => ({
@@ -940,19 +1227,22 @@ INDEX_HTML = r"""
       return rows;
     }
 
-    function imageRow(item) {
+    function imageRow(item, gazeEnabled) {
       const normalizedUrl = item.normalized.public_url || item.normalized.upload_url || "";
       const fullFrameUrl = item.fullFrame
         ? (item.fullFrame.public_url || item.fullFrame.upload_url || normalizedUrl)
         : inferFullFrameUrl(normalizedUrl);
+      const fullFrameAttributes = gazeEnabled
+        ? `href="${esc(fullFrameUrl)}" data-gaze-overlay data-source-event-id="${esc(item.source_event_id || "")}" data-full-frame-url="${esc(fullFrameUrl)}"`
+        : `href="${esc(fullFrameUrl)}" target="_blank" rel="noreferrer"`;
       return `
         <div class="image-row">
-          <a href="${esc(fullFrameUrl)}" target="_blank" rel="noreferrer">
+          <a ${fullFrameAttributes}>
             <img class="thumb" src="${esc(normalizedUrl)}" loading="lazy" alt="normalized" />
           </a>
           <div class="link-meta">
             <strong>normalized</strong>
-            <a href="${esc(fullFrameUrl)}" target="_blank" rel="noreferrer">open full_frame</a>
+            <a ${fullFrameAttributes}>open full_frame</a>
             ${item.camera_id ? `<span>camera ${esc(item.camera_id)}</span>` : ""}
             <span>${esc(item.event_timestamp || "")}</span>
             <span>${esc(item.source_event_id || "")}</span>
@@ -969,15 +1259,15 @@ INDEX_HTML = r"""
       return inferred === normalizedUrl ? normalizedUrl : inferred;
     }
 
-    function latestImage(mediaLinks) {
+    function latestImage(mediaLinks, gazeEnabled) {
       const rows = normalizedImageItems(mediaLinks);
       if (!rows.length) {
         return `<div class="meta">no media links</div>`;
       }
-      return imageRow(rows[rows.length - 1]);
+      return imageRow(rows[rows.length - 1], gazeEnabled);
     }
 
-    function imageHistory(identityKey, mediaLinks) {
+    function imageHistory(identityKey, mediaLinks, gazeEnabled) {
       const rows = normalizedImageItems(mediaLinks);
       if (rows.length <= 1) {
         return "";
@@ -986,7 +1276,7 @@ INDEX_HTML = r"""
       return `
         <details data-details-key="${esc(detailsKey)}" ${openDetails.has(detailsKey) ? "open" : ""}>
           <summary>Image history (${rows.length - 1})</summary>
-          <div class="images">${rows.slice(0, -1).map(imageRow).join("")}</div>
+          <div class="images">${rows.slice(0, -1).map(item => imageRow(item, gazeEnabled)).join("")}</div>
         </details>
       `;
     }
@@ -1053,6 +1343,7 @@ INDEX_HTML = r"""
     function card(identity) {
       const fieldsKey = `${identity.key}:fields`;
       const isPerson = identity.detection_type === "person";
+      const gazeEnabled = identity.detection_type === "silhouette";
       return `
         <article class="card" data-identity-id="${esc(identity.identity_id)}">
           <div class="card-head">
@@ -1068,8 +1359,8 @@ INDEX_HTML = r"""
             <summary>Fields</summary>
             <div class="fields">${fieldRows(identity.fields)}</div>
           </details>
-          ${isPerson ? "" : `<div class="images">${latestImage(identity.media_links || [])}</div>`}
-          ${isPerson ? "" : imageHistory(identity.key, identity.media_links || [])}
+          ${isPerson ? "" : `<div class="images">${latestImage(identity.media_links || [], gazeEnabled)}</div>`}
+          ${isPerson ? "" : imageHistory(identity.key, identity.media_links || [], gazeEnabled)}
         </article>
       `;
     }
@@ -1160,11 +1451,28 @@ INDEX_HTML = r"""
     poll();
 
     document.addEventListener("click", event => {
+      const imageLink = event.target.closest("[data-gaze-overlay]");
+      if (imageLink) {
+        event.preventDefault();
+        openGazeModal(
+          imageLink.getAttribute("data-source-event-id") || "",
+          imageLink.getAttribute("data-full-frame-url") || imageLink.getAttribute("href") || "",
+        );
+        return;
+      }
       const button = event.target.closest("[data-jump-identity]");
       if (!button) {
         return;
       }
       scrollToIdentity(button.getAttribute("data-jump-identity"));
+    });
+
+    document.getElementById("gaze-modal-close").addEventListener("click", closeGazeModal);
+    gazeModalBody.addEventListener("click", event => {
+      if (event.target === gazeModalBody) closeGazeModal();
+    });
+    document.addEventListener("keydown", event => {
+      if (event.key === "Escape" && gazeModal.classList.contains("open")) closeGazeModal();
     });
 
     document.getElementById("clear-hot-state").addEventListener("click", async event => {
