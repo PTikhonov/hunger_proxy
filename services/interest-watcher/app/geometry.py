@@ -134,6 +134,20 @@ def ray_intersects_shelf(
     return point_in_polygon_3d(intersection, points, normal), intersection
 
 
+def viewing_side(points: Sequence[Sequence[float]], direction: Sequence[float]) -> str | None:
+    """Return the hunger-head shelf side approached by the gaze ray.
+
+    Hunger-head's UI arrow A is opposite to the normal operand order, therefore
+    a negative ray/normal denominator represents side A and a positive one B.
+    """
+    denominator = dot(plane_normal(points), direction)
+    if denominator < -EPSILON:
+        return "A"
+    if denominator > EPSILON:
+        return "B"
+    return None
+
+
 def point_in_polygon_3d(point: Sequence[float], points: Sequence[Sequence[float]], normal: Sequence[float]) -> bool:
     # Drop the dominant normal axis, avoiding the XY-only limitation of the prototype.
     dropped_axis = max(range(3), key=lambda index: abs(normal[index]))

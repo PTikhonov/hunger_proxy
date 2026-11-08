@@ -59,6 +59,7 @@ class CameraGeometrySnapshot(BaseModel):
 
     schema_version: int = Field(default=1, ge=1)
     camera_id: str | int
+    location_id: int | None = None
     revision: int = Field(ge=1)
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     camera: CameraParameters
@@ -87,6 +88,13 @@ class ApplyResult(BaseModel):
     checksum: str
 
 
+class PromotionRulesApplyResult(BaseModel):
+    status: Literal["created", "updated", "unchanged"]
+    location_id: int
+    revision: int
+    checksum: str
+
+
 class GeometryRecord(BaseModel):
     camera_id: str
     revision: int
@@ -102,3 +110,27 @@ class GeometryListItem(BaseModel):
     revision: int
     updated_at: str
     deleted: bool
+
+
+class PromotionRulesSnapshot(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: int = Field(default=1, ge=1)
+    location_id: int = Field(ge=1)
+    revision: int = Field(ge=1)
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    thresholds_seconds: dict[str, int | float]
+    cooldowns_seconds: dict[str, int | float]
+    # Per-location delivery configuration. Credentials stay in this immutable
+    # rules snapshot and are never copied into the offer stream.
+    delivery: dict[str, Any] = Field(default_factory=dict)
+    rules: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class PromotionRulesRecord(BaseModel):
+    location_id: int
+    revision: int
+    schema_version: int
+    checksum: str
+    updated_at: str
+    payload: dict[str, Any]

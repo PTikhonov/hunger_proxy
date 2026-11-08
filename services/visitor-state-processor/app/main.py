@@ -145,6 +145,7 @@ class VisitorStateProcessor:
                 bbox=payload.bbox,
                 age=extraction.age if extraction.age is not None else payload.age,
                 gender=extraction.gender or payload.gender,
+                head_pose=extraction.head_pose if detection_type == "face" else payload.head_pose,
                 media=payload.media,
                 raw_detection=payload.model_dump(mode="json"),
             )
@@ -246,6 +247,9 @@ class VisitorStateProcessor:
         observed_ts = self._observed_timestamp(payload)
         key = f"identity:{identity_id}"
         previous_seen_raw = await self._hot_state_redis.hget(key, "last_seen_epoch")
+        previous_demographics = await self._hot_state_redis.hmget(
+            key, "face_age", "face_gender", "silhouette_age", "silhouette_gender"
+        )
         total_presence_seconds = await self._presence_total_seconds(key, previous_seen_raw, observed_ts)
         media_links = await self._media_links(key, payload)
         camera_ids = await self._append_unique_json_values(
@@ -273,11 +277,24 @@ class VisitorStateProcessor:
             "gender": extraction.gender or payload.gender or "",
             "body_age": extraction.body_age or "",
             "body_gender": extraction.body_gender or "",
+            "head_pose": json.dumps(extraction.head_pose, ensure_ascii=True) if extraction.head_pose else "",
             "updated_at": now,
             "last_seen_epoch": str(observed_ts),
             "presence_total_seconds": str(total_presence_seconds),
             "media_links": json.dumps(media_links, ensure_ascii=True),
         }
+        face_age, face_gender, silhouette_age, silhouette_gender = previous_demographics
+        if detection_type == "face":
+            mapping["face_age"] = str(extraction.age) if extraction.age is not None else (face_age or "")
+            mapping["face_gender"] = extraction.gender or payload.gender or face_gender or ""
+            mapping["face_head_pose"] = (
+                json.dumps(extraction.head_pose, ensure_ascii=True) if extraction.head_pose else ""
+            )
+        elif detection_type == "silhouette":
+            mapping["silhouette_age"] = extraction.body_age or silhouette_age or ""
+            mapping["silhouette_gender"] = (
+                extraction.body_gender or extraction.gender or payload.gender or silhouette_gender or ""
+            )
         exists = await self._hot_state_redis.exists(key)
         if not exists:
             mapping["first_seen_at"] = now

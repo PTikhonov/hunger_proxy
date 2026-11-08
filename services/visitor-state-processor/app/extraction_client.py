@@ -78,6 +78,7 @@ class ExtractionClient:
         age = _extract_age(entity)
         body_age = _extract_body_age(entity)
         body_gender = _extract_body_gender(entity)
+        head_pose = _extract_head_pose(entity)
 
         logger.debug(
             "Extracted embedding dimensions=%s confidence=%s age=%s gender=%s body_age=%s body_gender=%s",
@@ -95,6 +96,7 @@ class ExtractionClient:
             gender=gender,
             body_age=body_age,
             body_gender=body_gender,
+            head_pose=head_pose,
             raw=entity if isinstance(entity, dict) else {"entity": entity},
         )
 
@@ -108,6 +110,8 @@ class ExtractionClient:
                     age_field=self._settings.face_age_field,
                     need_gender=self._settings.face_extraction_need_gender,
                     gender_field=self._settings.face_gender_field,
+                    need_headpose=self._settings.face_extraction_need_headpose,
+                    headpose_field=self._settings.face_headpose_field,
                 ),
                 self._settings.face_embedding_field,
             )
@@ -120,6 +124,8 @@ class ExtractionClient:
                     age_field=self._settings.silhouette_age_field,
                     need_gender=self._settings.silhouette_extraction_need_gender,
                     gender_field=self._settings.silhouette_gender_field,
+                    need_headpose=False,
+                    headpose_field="",
                 ),
                 self._settings.silhouette_embedding_field,
             )
@@ -132,12 +138,16 @@ class ExtractionClient:
         age_field: str,
         need_gender: bool,
         gender_field: str,
+        need_headpose: bool,
+        headpose_field: str,
     ) -> tuple[str, ...]:
         attributes = list(base)
         if need_age and age_field not in attributes:
             attributes.append(age_field)
         if need_gender and gender_field not in attributes:
             attributes.append(gender_field)
+        if need_headpose and headpose_field not in attributes:
+            attributes.append(headpose_field)
         return tuple(attributes)
 
 
@@ -249,6 +259,22 @@ def _extract_gender(entity: Any) -> str | None:
     if gender:
         return str(gender)
     return None
+
+
+def _extract_head_pose(entity: Any) -> dict[str, float] | None:
+    """Read the calibrated face_headpose attribute returned by Extraction API."""
+    headpose = _attribute_result(entity, "face_headpose")
+    if isinstance(headpose, dict) and isinstance(headpose.get("result"), dict):
+        headpose = headpose["result"]
+    if not isinstance(headpose, dict):
+        return None
+    result: dict[str, float] = {}
+    for name in ("pitch", "roll", "yaw"):
+        value = _number_or_none(headpose.get(name))
+        if value is None:
+            return None
+        result[name] = float(value)
+    return result
 
 
 def _extract_age(entity: Any) -> float | int | None:

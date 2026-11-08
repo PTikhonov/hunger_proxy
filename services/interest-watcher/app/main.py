@@ -5,7 +5,7 @@ import json
 import logging
 import sys
 from datetime import datetime, timezone
-from time import monotonic, time
+from time import time
 from typing import Any
 
 import httpx
@@ -14,13 +14,17 @@ from redis.exceptions import ResponseError
 
 from app.config import settings
 from app.extraction import ExtractionClient, HeadNotDetectedError
-from app.geometry import gaze_vector, head_point, project_direction, project_point, ray_intersects_shelf
+from app.geometry import gaze_vector, head_point, project_direction, project_point, ray_intersects_shelf, viewing_side
 
 
 logger = logging.getLogger(settings.app_name)
 
 
 class UnrecoverableMediaError(RuntimeError):
+    pass
+
+
+class UnrecoverableObservationError(RuntimeError):
     pass
 
 UPDATE_INTEREST_SCRIPT = """
@@ -42,9 +46,10 @@ local previous = tonumber(redis.call('HGET', key, last_field) or '')
 local was_active = redis.call('HGET', key, active_field) == 'true'
 local misses = tonumber(redis.call('HGET', key, misses_field) or '0')
 local active = was_active
+local delta = 0
 if intersects == 'true' then
   if previous and was_active then
-    local delta = observed - previous
+    delta = observed - previous
     if delta >= 0 and delta <= gap then total = total + delta end
   end
   active = true
@@ -61,7 +66,82 @@ redis.call('HSET', key,
   prefix .. ':updated_at', now_iso,
   prefix .. ':detail', detail)
 redis.call('EXPIRE', key, ttl)
-return tostring(total)
+return {tostring(total), tostring(delta or 0)}
+"""
+
+
+UPDATE_CATEGORY_INTEREST_SCRIPT = """
+local key = KEYS[1]
+local camera_prefix = ARGV[1]
+local location_category_prefix = ARGV[2]
+local observed = tonumber(ARGV[3])
+local now_iso = ARGV[4]
+local detail = ARGV[5]
+local ttl = tonumber(ARGV[6])
+local camera_total_field = camera_prefix .. ':total_seconds'
+local camera_last_field = camera_prefix .. ':last_observed_epoch'
+local camera_active_field = camera_prefix .. ':intersects'
+local category_total_field = location_category_prefix .. ':total_seconds'
+local camera_total = tonumber(redis.call('HGET', key, camera_total_field) or '0')
+local category_total = tonumber(redis.call('HGET', key, category_total_field) or '0')
+local previous_category_total = category_total
+local previous = tonumber(redis.call('HGET', key, camera_last_field) or '')
+local was_active = redis.call('HGET', key, camera_active_field) == 'true'
+local delta = 0
+if previous and was_active then
+  delta = observed - previous
+  if delta < 0 or delta > tonumber(ARGV[7]) then delta = 0 end
+end
+camera_total = camera_total + delta
+category_total = category_total + delta
+redis.call('HSET', key,
+  camera_total_field, tostring(camera_total),
+  camera_last_field, tostring(observed),
+  camera_active_field, 'true',
+  camera_prefix .. ':updated_at', now_iso,
+  camera_prefix .. ':detail', detail,
+  category_total_field, tostring(category_total),
+  location_category_prefix .. ':updated_at', now_iso,
+  location_category_prefix .. ':detail', detail)
+redis.call('EXPIRE', key, ttl)
+
+local triggers = cjson.decode(ARGV[10])
+local detail_object = cjson.decode(detail)
+local fired = 0
+for _, trigger in ipairs(triggers) do
+  local threshold = tonumber(trigger.threshold)
+  if threshold and previous_category_total < threshold and threshold <= category_total then
+    local cooldown_seconds = math.max(1, tonumber(trigger.cooldown_seconds) or 1)
+    local cooldown_key = trigger.cooldown_key
+    if redis.call('SET', cooldown_key, now_iso, 'NX', 'EX', cooldown_seconds) then
+      local event = {
+        event_type = 'interest_threshold_crossed',
+        occurred_at = now_iso,
+        person_id = detail_object.person_id,
+        location_id = detail_object.location_id,
+        camera_id = detail_object.camera_id,
+        matched_category_id = detail_object.matched_category_id,
+        previous_total_seconds = previous_category_total,
+        total_seconds = category_total,
+        delta_seconds = delta,
+        threshold_seconds = threshold,
+        context_id = trigger.context_id,
+        rule_id = trigger.rule_id,
+        interest_lvl = trigger.interest_lvl,
+        priority = trigger.priority,
+        action = trigger.action,
+        rule_revision = trigger.rule_revision,
+        source_event_id = detail_object.source_event_id,
+        observation_stream_id = detail_object.observation_stream_id
+      }
+      redis.call('XADD', ARGV[8], 'MAXLEN', '~', ARGV[9], '*',
+        'event_type', 'interest_threshold_crossed',
+        'payload', cjson.encode(event))
+      fired = fired + 1
+    end
+  end
+end
+return {tostring(camera_total), tostring(category_total), tostring(delta), tostring(fired)}
 """
 
 
@@ -86,6 +166,7 @@ class InterestWatcher:
         self.geometry = geometry
         self.extraction = extraction
         self.http = http
+        self._read_pending_next = False
 
     async def run(self) -> None:
         await self._ensure_group()
@@ -94,10 +175,17 @@ class InterestWatcher:
             for message_id, fields in await self._read():
                 try:
                     await self._process(message_id, fields)
-                except (UnrecoverableMediaError, HeadNotDetectedError) as exc:
+                except (UnrecoverableMediaError, UnrecoverableObservationError, HeadNotDetectedError) as exc:
                     await self._dead_letter_and_ack(message_id, fields, str(exc))
-                except Exception:
-                    logger.exception("Failed observation message_id=%s", message_id)
+                except Exception as exc:
+                    if await self._retry_limit_reached(message_id):
+                        await self._dead_letter_and_ack(
+                            message_id,
+                            fields,
+                            f"retry limit ({settings.max_retries}) reached: {exc}",
+                        )
+                    else:
+                        logger.exception("Failed observation message_id=%s", message_id)
                 else:
                     await self.stream.xack(settings.observations_stream, settings.consumer_group, message_id)
 
@@ -109,6 +197,25 @@ class InterestWatcher:
                 raise
 
     async def _read(self) -> list[tuple[str, dict[str, str]]]:
+        if self._read_pending_next:
+            pending = await self._claim_pending()
+            self._read_pending_next = False
+            if pending:
+                return pending
+        response = await self.stream.xreadgroup(
+            settings.consumer_group,
+            settings.consumer_name,
+            streams={settings.observations_stream: ">"},
+            count=settings.batch_size,
+            block=settings.block_ms,
+        )
+        messages = [(str(message_id), fields) for _, messages in response for message_id, fields in messages]
+        if messages:
+            self._read_pending_next = True
+            return messages
+        return await self._claim_pending()
+
+    async def _claim_pending(self) -> list[tuple[str, dict[str, str]]]:
         claimed = await self.stream.xautoclaim(
             settings.observations_stream,
             settings.consumer_group,
@@ -117,16 +224,17 @@ class InterestWatcher:
             start_id="0-0",
             count=settings.batch_size,
         )
-        if len(claimed) > 1 and claimed[1]:
-            return [(str(message_id), fields) for message_id, fields in claimed[1]]
-        response = await self.stream.xreadgroup(
+        return [(str(message_id), fields) for message_id, fields in claimed[1]] if len(claimed) > 1 else []
+
+    async def _retry_limit_reached(self, message_id: str) -> bool:
+        pending = await self.stream.xpending_range(
+            settings.observations_stream,
             settings.consumer_group,
-            settings.consumer_name,
-            streams={settings.observations_stream: ">"},
-            count=settings.batch_size,
-            block=settings.block_ms,
+            min=message_id,
+            max=message_id,
+            count=1,
         )
-        return [(str(message_id), fields) for _, messages in response for message_id, fields in messages]
+        return bool(pending) and int(pending[0].get("times_delivered", 0)) >= settings.max_retries
 
     async def _process(self, message_id: str, fields: dict[str, str]) -> None:
         observation = _observation(fields)
@@ -134,14 +242,12 @@ class InterestWatcher:
             return
         identity_id = str(observation.get("identity_id") or "")
         camera_id = str(observation.get("camera_id") or "")
-        if not identity_id or not camera_id:
-            return
+        person_id = str(observation.get("person_id") or fields.get("person_id") or "")
+        if not identity_id or not camera_id or not person_id:
+            raise UnrecoverableObservationError("person event is missing person_id, identity_id or camera_id")
         geometry = await self._camera_geometry(camera_id)
         if geometry is None:
             return
-        person_id = await self._resolve_person(identity_id)
-        if not person_id:
-            raise RuntimeError(f"person is not yet available for silhouette identity {identity_id}")
         media_info = _normalized_media(observation.get("media"))
         image = await self._load_image(media_info)
         if not image:
@@ -161,8 +267,10 @@ class InterestWatcher:
         origin = head_point(geometry["camera"], full_bbox, settings.head_height_meters)
         direction = gaze_vector(pose["yaw"], pose["pitch"], pose["roll"])
         observed_epoch = _event_epoch(observation)
+        demographics = await self._silhouette_demographics(identity_id)
         hits: list[str] = []
         shelf_annotations: list[dict[str, Any]] = []
+        category_hits: dict[int, list[dict[str, Any]]] = {}
         for shelf in geometry.get("shelves") or []:
             shelf_id = str(shelf["shelf_id"])
             intersects, point = ray_intersects_shelf(
@@ -173,6 +281,11 @@ class InterestWatcher:
             )
             if intersects:
                 hits.append(shelf_id)
+            matched_category_id = _matched_category_id(shelf, direction) if intersects else None
+            detail = {"source_event_id": observation.get("source_event_id"), "head_bbox": full_bbox,
+                      "head_pose": pose, "head_point": origin, "gaze_vector": direction,
+                      "intersection_point": point, "observation_stream_id": message_id,
+                      "demographics": demographics}
             shelf_annotations.append({
                 "shelf_id": shelf_id,
                 "name": shelf.get("name"),
@@ -180,14 +293,25 @@ class InterestWatcher:
                 "category_2_id": shelf.get("category_2_id"),
                 "points_px": [_project_optional(geometry["camera"], item) for item in shelf["points"]],
                 "intersects": intersects,
+                "matched_category_id": matched_category_id,
                 "intersection_px": _project_optional(geometry["camera"], point),
                 "viewing_direction": _viewing_direction(shelf),
             })
             await self._update_interest(
                 person_id, camera_id, shelf, observed_epoch, intersects,
-                {"source_event_id": observation.get("source_event_id"), "head_bbox": full_bbox,
-                 "head_pose": pose, "head_point": origin, "gaze_vector": direction,
-                 "intersection_point": point, "observation_stream_id": message_id},
+                detail, matched_category_id, geometry.get("location_id"),
+            )
+            if matched_category_id is not None:
+                category_hits.setdefault(matched_category_id, []).append(detail)
+        for category_id, details in category_hits.items():
+            location_id = _location_id(geometry.get("location_id"))
+            if location_id is None:
+                logger.warning("Skipping category interest without location_id camera_id=%s category_id=%s", camera_id, category_id)
+                continue
+            threshold_rules = await self._threshold_rules(person_id, location_id, category_id)
+            await self._update_category_interest(
+                person_id, camera_id, location_id, category_id, observed_epoch,
+                details[0], threshold_rules,
             )
         await self._store_gaze_annotation(
             observation=observation,
@@ -273,15 +397,16 @@ class InterestWatcher:
             return None
         return payload
 
-    async def _resolve_person(self, identity_id: str) -> str:
-        deadline = monotonic() + settings.person_resolve_timeout_seconds
-        while True:
-            person_id = str(await self.hot.hget(f"identity:{identity_id}", "person_id") or "")
-            if person_id and await self.hot.exists(person_id):
-                return person_id
-            if monotonic() >= deadline:
-                return ""
-            await asyncio.sleep(settings.person_resolve_interval_seconds)
+    async def _silhouette_demographics(self, identity_id: str) -> dict[str, Any]:
+        age, gender, body_age, body_gender = await self.hot.hmget(
+            f"identity:{identity_id}", "age", "gender", "body_age", "body_gender",
+        )
+        return {
+            "age": _number_or_none(age),
+            "gender": gender or None,
+            "body_age": body_age or None,
+            "body_gender": body_gender or None,
+        }
 
     async def _load_image(self, media_info: dict[str, Any]) -> bytes | None:
         redis_key = str(media_info.get("redis_key") or "")
@@ -327,16 +452,19 @@ class InterestWatcher:
 
     async def _update_interest(
         self, person_id: str, camera_id: str, shelf: dict[str, Any], observed_epoch: float,
-        intersects: bool, detail: dict[str, Any],
+        intersects: bool, detail: dict[str, Any], matched_category_id: int | None,
+        location_id: Any,
     ) -> None:
         shelf_id = str(shelf["shelf_id"])
         prefix = f"interest:{camera_id}:{shelf_id}"
         detail.update({
             "camera_id": camera_id,
+            "location_id": location_id,
             "shelf_id": shelf_id,
             "shelf_name": shelf.get("name"),
             "category_id": shelf.get("category_id"),
             "category_2_id": shelf.get("category_2_id"),
+            "matched_category_id": matched_category_id,
             "intersects": intersects,
         })
         await self.hot.eval(
@@ -345,6 +473,49 @@ class InterestWatcher:
             datetime.now(timezone.utc).isoformat(), json.dumps(detail, ensure_ascii=True), settings.person_ttl_seconds,
             settings.interest_misses_before_reset,
         )
+
+    async def _update_category_interest(
+        self, person_id: str, camera_id: str, location_id: Any, category_id: int,
+        observed_epoch: float, detail: dict[str, Any], threshold_rules: list[dict[str, Any]],
+    ) -> None:
+        camera_prefix = f"interest-category:{camera_id}:{category_id}"
+        location_category_prefix = f"interest-category:{location_id}:{category_id}"
+        category_detail = dict(detail)
+        category_detail.update({
+            "person_id": person_id,
+            "camera_id": camera_id,
+            "location_id": location_id,
+            "matched_category_id": category_id,
+            "intersects": True,
+        })
+        result = await self.hot.eval(
+            UPDATE_CATEGORY_INTEREST_SCRIPT, 1, person_id,
+            camera_prefix, location_category_prefix, observed_epoch,
+            datetime.now(timezone.utc).isoformat(), json.dumps(category_detail, ensure_ascii=True),
+            settings.person_ttl_seconds, settings.interest_gap_seconds,
+            settings.threshold_events_stream, settings.threshold_events_maxlen,
+            json.dumps(threshold_rules, ensure_ascii=True),
+        )
+        if int(result[3]) > 0:
+            logger.info(
+                "Published interest threshold event person_id=%s location_id=%s category_id=%s count=%s",
+                person_id, location_id, category_id, result[3],
+            )
+
+    async def _threshold_rules(self, person_id: str, location_id: int, category_id: int) -> list[dict[str, Any]]:
+        raw_payload = await self.geometry.hget(
+            f"{settings.promotion_rules_key_prefix}:{location_id}", "payload",
+        )
+        if not raw_payload:
+            return []
+        try:
+            payload = json.loads(raw_payload)
+        except (TypeError, ValueError):
+            logger.warning("Invalid promotion rules payload location_id=%s", location_id)
+            return []
+        if not isinstance(payload, dict):
+            return []
+        return _threshold_rules(payload, person_id, location_id, category_id)
 
 
 def _observation(fields: dict[str, str]) -> dict[str, Any]:
@@ -379,6 +550,102 @@ def _event_epoch(observation: dict[str, Any]) -> float:
     if timestamp:
         return datetime.fromisoformat(timestamp.replace("Z", "+00:00")).timestamp()
     return time()
+
+
+def _number_or_none(value: Any) -> float | int | None:
+    if value in (None, ""):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return int(number) if number.is_integer() else number
+
+
+def _location_id(value: Any) -> int | None:
+    try:
+        location_id = int(value)
+    except (TypeError, ValueError):
+        return None
+    return location_id if location_id > 0 else None
+
+
+def _threshold_rules(
+    payload: dict[str, Any], person_id: str, location_id: int, category_id: int,
+) -> list[dict[str, Any]]:
+    """Return location rules eligible to emit a category threshold event.
+
+    Demographic selection remains the responsibility of the reaction service;
+    this worker's authoritative fact is the category-interest threshold crossing.
+    """
+    thresholds = payload.get("thresholds_seconds")
+    cooldowns = payload.get("cooldowns_seconds")
+    rules = payload.get("rules")
+    if not isinstance(thresholds, dict) or not isinstance(cooldowns, dict) or not isinstance(rules, list):
+        return []
+    level_names = {1: "passed", 2: "attention", 3: "involved", 4: "buy"}
+    revision = _number_or_none(payload.get("revision"))
+    result: list[dict[str, Any]] = []
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        rule_category = rule.get("category_id")
+        if rule_category not in (None, category_id):
+            continue
+        try:
+            interest_level = int(rule.get("interest_lvl"))
+        except (TypeError, ValueError):
+            continue
+        threshold = _number_or_none(thresholds.get(level_names.get(interest_level, "")))
+        if threshold is None or threshold <= 0:
+            continue
+        action = rule.get("action") if isinstance(rule.get("action"), dict) else {}
+        context_id = _number_or_none(rule.get("context_id"))
+        rule_id = _number_or_none(action.get("id")) or context_id
+        if context_id is None or rule_id is None:
+            continue
+        cooldown_seconds = _cooldown_seconds(action, cooldowns)
+        threshold_label = format(float(threshold), "g")
+        cooldown_key = (
+            f"{settings.threshold_cooldown_prefix}:{person_id}:{location_id}:{category_id}:"
+            f"{int(context_id)}:{int(rule_id)}:{threshold_label}"
+        )
+        result.append({
+            "context_id": int(context_id),
+            "rule_id": int(rule_id),
+            "interest_lvl": interest_level,
+            "priority": int(_number_or_none(rule.get("priority")) or 0),
+            "threshold": threshold,
+            "cooldown_seconds": cooldown_seconds,
+            "cooldown_key": cooldown_key,
+            "rule_revision": int(revision) if revision is not None else None,
+            "action": action,
+        })
+    return result
+
+
+def _cooldown_seconds(action: dict[str, Any], cooldowns: dict[str, Any]) -> int:
+    action_type = str(action.get("type") or "").lower()
+    if "audio" in action_type or "ауди" in action_type:
+        key = "audio"
+    elif "telegram" in action_type or "телеграм" in action_type:
+        key = "telegram"
+    else:
+        key = "video"
+    value = _number_or_none(cooldowns.get(key))
+    return max(1, int(value or 0))
+
+
+def _matched_category_id(shelf: dict[str, Any], direction: tuple[float, float, float]) -> int | None:
+    side = viewing_side(shelf["points"], direction)
+    if side is None:
+        return None
+    for category_field, side_field in (("category_id", "side"), ("category_2_id", "side_2")):
+        category_id = shelf.get(category_field)
+        configured_side = str(shelf.get(side_field) or "").upper()
+        if category_id is not None and side in configured_side:
+            return int(category_id)
+    return None
 
 
 def _viewing_direction(shelf: dict[str, Any]) -> str:

@@ -1,4 +1,4 @@
-from app.schemas import ShelfGeometry
+from app.schemas import PromotionRulesSnapshot, ShelfGeometry
 
 
 POINTS = [(0, 0, 1), (0, 1, 1), (1, 1, 1), (1, 0, 1)]
@@ -19,3 +19,13 @@ def test_explicit_viewing_direction_is_preserved() -> None:
     )
     assert shelf.viewing_direction == "opposite"
 
+
+def test_promotion_rules_snapshot_accepts_complete_location_rules() -> None:
+    snapshot = PromotionRulesSnapshot(
+        location_id=1,
+        revision=2,
+        thresholds_seconds={"passed": 1, "attention": 5, "involved": 15, "buy": 45},
+        cooldowns_seconds={"audio": 120, "video": 60, "telegram": 10},
+        rules=[],
+    )
+    assert snapshot.location_id == 1

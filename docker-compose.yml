@@ -37,6 +37,11 @@ services:
       GEOMETRY_KEY_PREFIX: hunger:geometry:camera
       GEOMETRY_CAMERA_INDEX: hunger:geometry:cameras
       GEOMETRY_CHANGED_CHANNEL: hunger:geometry:changed
+      PROMOTION_RULES_KEY_PREFIX: hunger:promotion-rules:location
+      PROMOTION_RULES_REVISION_KEY_PREFIX: hunger:promotion-rules:location
+      PROMOTION_RULES_REVISION_TTL_SECONDS: ${PROMOTION_RULES_REVISION_TTL_SECONDS:-604800}
+      PROMOTION_RULES_LOCATION_INDEX: hunger:promotion-rules:locations
+      PROMOTION_RULES_CHANGED_CHANNEL: hunger:promotion-rules:changed
       HUNGER_PROXY_API_TOKEN: ${HUNGER_PROXY_API_TOKEN:-}
     ports:
       - "8008:8008"
@@ -114,8 +119,10 @@ services:
       FACE_EMBEDDING_FIELD: ${FACE_EMBEDDING_FIELD:-face_emben}
       FACE_AGE_FIELD: ${FACE_AGE_FIELD:-face_age}
       FACE_GENDER_FIELD: ${FACE_GENDER_FIELD:-face_gender}
+      FACE_HEADPOSE_FIELD: ${FACE_HEADPOSE_FIELD:-face_headpose}
       FACE_EXTRACTION_NEED_AGE: ${FACE_EXTRACTION_NEED_AGE:-true}
       FACE_EXTRACTION_NEED_GENDER: ${FACE_EXTRACTION_NEED_GENDER:-true}
+      FACE_EXTRACTION_NEED_HEADPOSE: ${FACE_EXTRACTION_NEED_HEADPOSE:-true}
       SILHOUETTE_EXTRACTION_DETECTOR: ${SILHOUETTE_EXTRACTION_DETECTOR:-body}
       SILHOUETTE_EXTRACTION_ATTRIBUTES: ${SILHOUETTE_EXTRACTION_ATTRIBUTES:-body_emben}
       SILHOUETTE_EMBEDDING_FIELD: ${SILHOUETTE_EMBEDDING_FIELD:-body_emben}
@@ -178,17 +185,20 @@ services:
       REDIS_STREAM_URL: redis://redis-streams:6379/0
       REDIS_HOT_STATE_URL: redis://redis-hot-state:6379/0
       REDIS_GEOMETRY_URL: redis://redis-hot-state:6379/1
-      IDENTITY_OBSERVATIONS_STREAM: stream:identity-observations
-      IDENTITY_OBSERVATIONS_CONSUMER_GROUP: interest-watcher
+      PERSON_EVENTS_STREAM: stream:person-events
+      INTEREST_CONSUMER_GROUP: interest-watcher
       INTEREST_BATCH_SIZE: ${INTEREST_BATCH_SIZE:-10}
       INTEREST_BLOCK_MS: ${INTEREST_BLOCK_MS:-5000}
       INTEREST_PENDING_IDLE_MS: ${INTEREST_PENDING_IDLE_MS:-30000}
+      INTEREST_MAX_RETRIES: ${INTEREST_MAX_RETRIES:-5}
       INTEREST_DEAD_LETTER_STREAM: ${INTEREST_DEAD_LETTER_STREAM:-stream:interest-watcher-dead-letter}
       INTEREST_DEAD_LETTER_MAXLEN: ${INTEREST_DEAD_LETTER_MAXLEN:-10000}
+      INTEREST_THRESHOLD_EVENTS_STREAM: ${INTEREST_THRESHOLD_EVENTS_STREAM:-stream:interest-threshold-events}
+      INTEREST_THRESHOLD_EVENTS_MAXLEN: ${INTEREST_THRESHOLD_EVENTS_MAXLEN:-100000}
+      INTEREST_THRESHOLD_COOLDOWN_PREFIX: ${INTEREST_THRESHOLD_COOLDOWN_PREFIX:-interest-threshold:cooldown}
+      PROMOTION_RULES_KEY_PREFIX: ${PROMOTION_RULES_KEY_PREFIX:-hunger:promotion-rules:location}
       INTEREST_GAP_SECONDS: ${INTEREST_GAP_SECONDS:-10}
       INTEREST_MISSES_BEFORE_RESET: ${INTEREST_MISSES_BEFORE_RESET:-3}
-      PERSON_RESOLVE_TIMEOUT_SECONDS: ${PERSON_RESOLVE_TIMEOUT_SECONDS:-3}
-      PERSON_RESOLVE_INTERVAL_SECONDS: ${PERSON_RESOLVE_INTERVAL_SECONDS:-0.1}
       PERSON_TTL_SECONDS: ${PERSON_TTL_SECONDS:-3600}
       EXTRACTION_API_URL: ${EXTRACTION_API_URL:-http://192.168.1.25:18666/v2}
       EXTRACTION_TIMEOUT_SECONDS: ${EXTRACTION_TIMEOUT_SECONDS:-5}
@@ -205,6 +215,64 @@ services:
     depends_on:
       redis-streams:
         condition: service_healthy
+      redis-hot-state:
+        condition: service_healthy
+
+  offer-generator:
+    build:
+      context: ./services/offer-generator
+    restart: unless-stopped
+    environment:
+      APP_NAME: offer-generator
+      REDIS_HOT_STATE_URL: redis://redis-hot-state:6379/0
+      REDIS_RULES_URL: redis://redis-hot-state:6379/1
+      INTEREST_THRESHOLD_EVENTS_STREAM: ${INTEREST_THRESHOLD_EVENTS_STREAM:-stream:interest-threshold-events}
+      OFFER_GENERATOR_CONSUMER_GROUP: ${OFFER_GENERATOR_CONSUMER_GROUP:-offer-generator}
+      OFFER_GENERATOR_BATCH_SIZE: ${OFFER_GENERATOR_BATCH_SIZE:-10}
+      OFFER_GENERATOR_BLOCK_MS: ${OFFER_GENERATOR_BLOCK_MS:-5000}
+      OFFER_GENERATOR_PENDING_IDLE_MS: ${OFFER_GENERATOR_PENDING_IDLE_MS:-30000}
+      OFFERS_STREAM: ${OFFERS_STREAM:-stream:offers}
+      OFFERS_STREAM_MAXLEN: ${OFFERS_STREAM_MAXLEN:-100000}
+      OFFER_GENERATOR_DEAD_LETTER_STREAM: ${OFFER_GENERATOR_DEAD_LETTER_STREAM:-stream:offer-generator-dead-letter}
+      OFFER_GENERATOR_DEAD_LETTER_MAXLEN: ${OFFER_GENERATOR_DEAD_LETTER_MAXLEN:-10000}
+      PROMOTION_RULES_KEY_PREFIX: ${PROMOTION_RULES_KEY_PREFIX:-hunger:promotion-rules:location}
+      PROMOTION_RULES_REVISION_KEY_PREFIX: ${PROMOTION_RULES_REVISION_KEY_PREFIX:-hunger:promotion-rules:location}
+      OFFER_DEDUPE_PREFIX: ${OFFER_DEDUPE_PREFIX:-offer:dedupe}
+      OFFER_STATE_PREFIX: ${OFFER_STATE_PREFIX:-offer}
+      OFFER_MIN_DEDUPE_SECONDS: ${OFFER_MIN_DEDUPE_SECONDS:-60}
+      LOG_LEVEL: ${LOG_LEVEL:-DEBUG}
+    depends_on:
+      redis-hot-state:
+        condition: service_healthy
+
+  telegram-delivery:
+    build:
+      context: ./services/telegram-delivery
+    restart: unless-stopped
+    environment:
+      APP_NAME: telegram-delivery
+      TELEGRAM_DELIVERY_ENABLED: ${TELEGRAM_DELIVERY_ENABLED:-true}
+      TELEGRAM_API_BASE_URL: ${TELEGRAM_API_BASE_URL:-https://api.telegram.org}
+      TELEGRAM_TIMEOUT_SECONDS: ${TELEGRAM_TIMEOUT_SECONDS:-10}
+      REDIS_HOT_STATE_URL: redis://redis-hot-state:6379/0
+      REDIS_RULES_URL: redis://redis-hot-state:6379/1
+      OFFERS_STREAM: ${OFFERS_STREAM:-stream:offers}
+      TELEGRAM_DELIVERY_CONSUMER_GROUP: ${TELEGRAM_DELIVERY_CONSUMER_GROUP:-telegram-delivery}
+      TELEGRAM_DELIVERY_BATCH_SIZE: ${TELEGRAM_DELIVERY_BATCH_SIZE:-10}
+      TELEGRAM_DELIVERY_BLOCK_MS: ${TELEGRAM_DELIVERY_BLOCK_MS:-5000}
+      TELEGRAM_DELIVERY_PENDING_IDLE_MS: ${TELEGRAM_DELIVERY_PENDING_IDLE_MS:-30000}
+      TELEGRAM_DELIVERY_DEAD_LETTER_STREAM: ${TELEGRAM_DELIVERY_DEAD_LETTER_STREAM:-stream:telegram-delivery-dead-letter}
+      TELEGRAM_DELIVERY_DEAD_LETTER_MAXLEN: ${TELEGRAM_DELIVERY_DEAD_LETTER_MAXLEN:-10000}
+      TELEGRAM_DELIVERY_SENT_TTL_SECONDS: ${TELEGRAM_DELIVERY_SENT_TTL_SECONDS:-604800}
+      PROMOTION_RULES_KEY_PREFIX: ${PROMOTION_RULES_KEY_PREFIX:-hunger:promotion-rules:location}
+      PROMOTION_RULES_REVISION_KEY_PREFIX: ${PROMOTION_RULES_REVISION_KEY_PREFIX:-hunger:promotion-rules:location}
+      # Hiddify HTTP proxy exposed by the host to the local network.
+      # Override the address in the environment when the host IP changes.
+      HTTP_PROXY: ${TELEGRAM_HTTP_PROXY:-http://192.168.1.25:12334}
+      HTTPS_PROXY: ${TELEGRAM_HTTPS_PROXY:-http://192.168.1.25:12334}
+      NO_PROXY: localhost,127.0.0.1,redis-hot-state,redis-streams
+      LOG_LEVEL: ${LOG_LEVEL:-DEBUG}
+    depends_on:
       redis-hot-state:
         condition: service_healthy
 

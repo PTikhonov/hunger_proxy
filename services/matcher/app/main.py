@@ -194,7 +194,8 @@ class MatcherService:
                     observation.get("camera_id"),
                     observation.get("new_body"),
                 )
-                await self._upsert_silhouette_person(message_id, observation)
+                person_id = await self._upsert_silhouette_person(message_id, observation)
+                await self._publish_silhouette_person_observation(message_id, observation, person_id)
                 await self._index_silhouette_observation(message_id, observation)
                 await self._stream.ack(message_id)
                 return
@@ -207,6 +208,7 @@ class MatcherService:
             is_new_face = _bool(observation.get("new_face") if "new_face" in observation else fields.get("new_face"))
             should_match_face, skip_reason = await self._should_match_face_observation(observation, is_new_face)
             if not should_match_face:
+                await self._sync_face_demographics_to_person(observation)
                 logger.debug(
                     "Skipping face observation reason=%s message_id=%s identity_id=%s camera_id=%s new_face=%s",
                     skip_reason,
@@ -352,6 +354,18 @@ class MatcherService:
             "updated_at": now,
             "last_seen_at": str(observation.get("last_seen_at") or now),
         }
+        silhouette_age = str(identity_fields.get("silhouette_age") or identity_fields.get("body_age") or "")
+        silhouette_gender = str(identity_fields.get("silhouette_gender") or identity_fields.get("body_gender") or "")
+        person_mapping.update({
+            "silhouette_age": silhouette_age,
+            "silhouette_gender": silhouette_gender,
+        })
+        if not person_fields.get("face_age") and silhouette_age:
+            person_mapping["age"] = silhouette_age
+            person_mapping["age_source"] = "silhouette"
+        if not person_fields.get("face_gender") and silhouette_gender:
+            person_mapping["gender"] = silhouette_gender
+            person_mapping["gender_source"] = "silhouette"
         if first_seen_epoch is not None:
             person_mapping["first_seen_epoch"] = str(first_seen_epoch)
         if last_seen_epoch is not None:
@@ -373,6 +387,25 @@ class MatcherService:
                 message_id,
             )
         return person_id
+
+    async def _sync_face_demographics_to_person(self, observation: dict[str, Any]) -> None:
+        """Refresh demographic fields for an already linked face without rematching it."""
+        face_identity_id = str(observation.get("identity_id") or "")
+        if not face_identity_id:
+            return
+        face_fields = await self._hot_state_redis.hgetall(f"identity:{face_identity_id}")
+        person_id = str(face_fields.get("person_id") or "")
+        if not person_id or not await self._hot_state_redis.exists(person_id):
+            return
+        face_age = str(face_fields.get("face_age") or face_fields.get("age") or "")
+        face_gender = str(face_fields.get("face_gender") or face_fields.get("gender") or "")
+        mapping = {"updated_at": datetime.now(timezone.utc).isoformat()}
+        if face_age:
+            mapping.update({"face_age": face_age, "age": face_age, "age_source": "face"})
+        if face_gender:
+            mapping.update({"face_gender": face_gender, "gender": face_gender, "gender_source": "face"})
+        if len(mapping) > 1:
+            await self._hot_state_redis.hset(person_id, mapping=mapping)
 
     async def _index_silhouette_observation(self, message_id: str, observation: dict[str, Any]) -> None:
         event_epoch = _event_epoch(observation)
@@ -403,6 +436,37 @@ class MatcherService:
         await self._hot_state_redis.expire(observation_key, settings.matcher_observation_ttl_seconds)
         await self._hot_state_redis.zadd(index_key, {message_id: event_epoch})
         await self._hot_state_redis.expire(index_key, settings.matcher_observation_ttl_seconds)
+
+    async def _publish_silhouette_person_observation(
+        self,
+        message_id: str,
+        observation: dict[str, Any],
+        person_id: str | None,
+    ) -> None:
+        """Publish a silhouette only after its person link has been committed."""
+        identity_id = str(observation.get("identity_id") or "")
+        camera_id = str(observation.get("camera_id") or "")
+        if not person_id or not identity_id or not camera_id:
+            raise ValueError("silhouette person event requires person_id, identity_id and camera_id")
+
+        payload = dict(observation)
+        payload.update({
+            "event_type": "person_observed",
+            "person_id": person_id,
+            "identity_observation_id": message_id,
+        })
+        await self._stream.append_person_event(
+            {
+                "event_type": "person_observed",
+                "person_id": person_id,
+                "identity_id": identity_id,
+                "detection_type": "silhouette",
+                "camera_id": camera_id,
+                "source_observation_id": message_id,
+                "source_event_id": str(observation.get("source_event_id") or ""),
+                "payload": json.dumps(payload, ensure_ascii=True),
+            }
+        )
 
     async def _process_ready_faces(self) -> None:
         now = time()
@@ -712,6 +776,26 @@ class MatcherService:
             "last_face_source_event_id": str(pending.observation.get("source_event_id") or ""),
             "last_body_source_event_id": str(candidate.get("source_event_id") or ""),
         }
+        face_age = str(face_fields.get("face_age") or face_fields.get("age") or "")
+        face_gender = str(face_fields.get("face_gender") or face_fields.get("gender") or "")
+        silhouette_age = str(silhouette_fields.get("silhouette_age") or silhouette_fields.get("body_age") or "")
+        silhouette_gender = str(
+            silhouette_fields.get("silhouette_gender") or silhouette_fields.get("body_gender") or ""
+        )
+        person_mapping.update({
+            "face_age": face_age,
+            "face_gender": face_gender,
+            "silhouette_age": silhouette_age,
+            "silhouette_gender": silhouette_gender,
+        })
+        if face_age:
+            person_mapping.update({"age": face_age, "age_source": "face"})
+        elif silhouette_age:
+            person_mapping.update({"age": silhouette_age, "age_source": "silhouette"})
+        if face_gender:
+            person_mapping.update({"gender": face_gender, "gender_source": "face"})
+        elif silhouette_gender:
+            person_mapping.update({"gender": silhouette_gender, "gender_source": "silhouette"})
 
         await self._hot_state_redis.hset(face_key, mapping=face_mapping)
         await self._hot_state_redis.hset(silhouette_key, mapping=silhouette_mapping)

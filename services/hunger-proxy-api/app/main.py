@@ -14,8 +14,11 @@ from app.schemas import (
     CameraGeometryTombstone,
     GeometryListItem,
     GeometryRecord,
+    PromotionRulesRecord,
+    PromotionRulesApplyResult,
+    PromotionRulesSnapshot,
 )
-from app.storage import GeometryStore, RevisionConflictError
+from app.storage import GeometryStore, PromotionRulesStore, RevisionConflictError
 
 
 @asynccontextmanager
@@ -24,6 +27,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await redis.ping()
     app.state.redis = redis
     app.state.geometry_store = GeometryStore(redis, settings)
+    app.state.promotion_rules_store = PromotionRulesStore(redis, settings)
     try:
         yield
     finally:
@@ -46,6 +50,13 @@ def geometry_store(request: Request) -> GeometryStore:
 
 
 StoreDependency = Annotated[GeometryStore, Depends(geometry_store)]
+
+
+def promotion_rules_store(request: Request) -> PromotionRulesStore:
+    return request.app.state.promotion_rules_store
+
+
+PromotionRulesStoreDependency = Annotated[PromotionRulesStore, Depends(promotion_rules_store)]
 
 
 @app.get("/health")
@@ -109,6 +120,33 @@ async def list_cameras(
     return [GeometryListItem.model_validate(item) for item in await store.list(include_deleted=include_deleted)]
 
 
+@app.put(
+    "/internal/v1/locations/{location_id}/promotion-rules",
+    response_model=PromotionRulesApplyResult,
+    dependencies=[Depends(require_service_token)],
+)
+async def put_promotion_rules(
+    location_id: int,
+    snapshot: PromotionRulesSnapshot,
+    store: PromotionRulesStoreDependency,
+) -> PromotionRulesApplyResult:
+    if snapshot.location_id != location_id:
+        raise HTTPException(status_code=422, detail="location_id in path and body must match")
+    return await _apply_promotion_rules(store, snapshot.model_dump(mode="json"))
+
+
+@app.get(
+    "/internal/v1/locations/{location_id}/promotion-rules",
+    response_model=PromotionRulesRecord,
+    dependencies=[Depends(require_service_token)],
+)
+async def get_promotion_rules(location_id: int, store: PromotionRulesStoreDependency) -> PromotionRulesRecord:
+    record = await store.get(location_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="promotion rules not found")
+    return PromotionRulesRecord.model_validate(record)
+
+
 async def _apply(store: GeometryStore, payload: dict[str, object]) -> ApplyResult:
     try:
         result = await store.apply(payload)
@@ -123,3 +161,24 @@ async def _apply(store: GeometryStore, payload: dict[str, object]) -> ApplyResul
             },
         ) from exc
     return ApplyResult.model_validate(result.__dict__)
+
+
+async def _apply_promotion_rules(store: PromotionRulesStore, payload: dict[str, object]) -> PromotionRulesApplyResult:
+    try:
+        result = await store.apply(payload)
+    except RevisionConflictError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": exc.reason,
+                "location_id": exc.camera_id,
+                "incoming_revision": exc.incoming_revision,
+                "current_revision": exc.current_revision,
+            },
+        ) from exc
+    return PromotionRulesApplyResult(
+        status=result.status,
+        location_id=int(result.camera_id),
+        revision=result.revision,
+        checksum=result.checksum,
+    )

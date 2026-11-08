@@ -158,3 +158,63 @@ class GeometryStore:
 
     def _key(self, camera_id: str) -> str:
         return f"{self._settings.geometry_key_prefix}:{camera_id}"
+
+
+class PromotionRulesStore:
+    def __init__(self, redis: Redis, settings: Settings) -> None:
+        self._redis = redis
+        self._settings = settings
+
+    async def apply(self, payload: dict[str, Any]) -> StoredApplyResult:
+        location_id = str(payload["location_id"])
+        revision = int(payload["revision"])
+        canonical_payload = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        checksum = hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()
+        event = json.dumps({"event_type": "promotion_rules_updated", "location_id": location_id, "revision": revision}, separators=(",", ":"))
+        result = await self._redis.eval(
+            APPLY_GEOMETRY_SCRIPT,
+            2,
+            self._key(location_id),
+            self._settings.promotion_rules_location_index,
+            revision,
+            checksum,
+            payload["schema_version"],
+            payload["updated_at"],
+            canonical_payload,
+            location_id,
+            "false",
+            self._settings.promotion_rules_changed_channel,
+            event,
+        )
+        status = str(result[0])
+        current_revision = int(result[1])
+        current_checksum = str(result[2])
+        if status in {"stale", "conflict"}:
+            raise RevisionConflictError(location_id, revision, current_revision, "stale_revision" if status == "stale" else "revision_checksum_conflict")
+        # Keep an immutable revision long enough for downstream stream consumers
+        # to select a promotion against the same rules that caused an interest event.
+        await self._redis.set(
+            self._revision_key(location_id, revision),
+            canonical_payload,
+            ex=self._settings.promotion_rules_revision_ttl_seconds,
+        )
+        return StoredApplyResult(status=status, camera_id=location_id, revision=current_revision, checksum=current_checksum)  # type: ignore[arg-type]
+
+    async def get(self, location_id: int | str) -> dict[str, Any] | None:
+        fields = await self._redis.hgetall(self._key(str(location_id)))
+        if not fields:
+            return None
+        return {
+            "location_id": int(fields["camera_id"]),
+            "revision": int(fields["revision"]),
+            "schema_version": int(fields["schema_version"]),
+            "checksum": str(fields["checksum"]),
+            "updated_at": str(fields["updated_at"]),
+            "payload": json.loads(fields["payload"]),
+        }
+
+    def _key(self, location_id: str) -> str:
+        return f"{self._settings.promotion_rules_key_prefix}:{location_id}"
+
+    def _revision_key(self, location_id: str, revision: int) -> str:
+        return f"{self._settings.promotion_rules_revision_key_prefix}:{location_id}:revision:{revision}"

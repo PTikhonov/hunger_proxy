@@ -37,6 +37,7 @@ class ExtractionResult(BaseModel):
     gender: str | None = None
     body_age: str | None = None
     body_gender: str | None = None
+    head_pose: dict[str, float] | None = None
     raw: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -68,6 +69,7 @@ class IdentityObservation(BaseModel):
     bbox: Any | None = None
     age: int | float | None = None
     gender: str | None = None
+    head_pose: dict[str, float] | None = None
     media: dict[str, Any] = Field(default_factory=dict)
     raw_detection: dict[str, Any] = Field(default_factory=dict)
 

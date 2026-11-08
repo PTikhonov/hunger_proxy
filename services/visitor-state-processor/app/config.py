@@ -57,8 +57,10 @@ class Settings:
     face_embedding_field: str = os.getenv("FACE_EMBEDDING_FIELD", os.getenv("EXTRACTION_EMBEDDING_FIELD", "face_emben"))
     face_age_field: str = os.getenv("FACE_AGE_FIELD", "face_age")
     face_gender_field: str = os.getenv("FACE_GENDER_FIELD", "face_gender")
+    face_headpose_field: str = os.getenv("FACE_HEADPOSE_FIELD", "face_headpose")
     face_extraction_need_age: bool = _bool_env("FACE_EXTRACTION_NEED_AGE", True)
     face_extraction_need_gender: bool = _bool_env("FACE_EXTRACTION_NEED_GENDER", True)
+    face_extraction_need_headpose: bool = _bool_env("FACE_EXTRACTION_NEED_HEADPOSE", True)
 
     silhouette_extraction_detector: str = os.getenv("SILHOUETTE_EXTRACTION_DETECTOR", "body")
     silhouette_extraction_attributes: tuple[str, ...] = _csv_env("SILHOUETTE_EXTRACTION_ATTRIBUTES", "body_emben")

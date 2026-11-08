@@ -1,6 +1,8 @@
 # Interest Watcher
 
-Consumes silhouette observations from `stream:identity-observations` in its own consumer group.
+Consumes matcher-enriched silhouette events from `stream:person-events` in its own consumer group.
+`matcher` writes the `person_id` into this event only after it has committed the
+identity-to-person link, so interest calculation does not race Redis hot-state.
 For every observation it loads the exact normalized silhouette crop, detects the head and
 `head_headpose_unconstrained` through Extraction API, translates the head bbox to full-frame
 coordinates using the silhouette bbox, and tests the gaze ray against every configured shelf.
@@ -23,12 +25,31 @@ the interval active; it is reset only on the third consecutive miss by default. 
 threshold with `INTEREST_MISSES_BEFORE_RESET`. The update is an atomic Redis Lua operation, so
 matcher updates to other person fields cannot be overwritten.
 
+Category interest is also recorded atomically in the same `person:*` hash:
+
+```text
+interest-category:<camera_id>:<category_id>:total_seconds
+interest-category:<location_id>:<category_id>:total_seconds
+```
+
+The second key is the canonical aggregate for reacting to category interest at a store. When
+its value crosses a context threshold from below, the same Redis Lua operation creates the
+idempotency/cooldown key
+`interest-threshold:cooldown:<person_id>:<location_id>:<category_id>:<context_id>:<rule_id>:<threshold>`
+and appends an `interest_threshold_crossed` record to `stream:interest-threshold-events` in
+Redis Hot State. A future reaction consumer must read that stream from Redis Hot State, not
+Redis Streams. The event includes the total before and after crossing, camera, matched category,
+context/rule/action, priority and rule revision.
+
 If the temporary Redis image has expired, the worker falls back to `public_url`/`upload_url`.
 When the image is absent from both locations, the unrecoverable observation is appended to
 `stream:interest-watcher-dead-letter` and acknowledged in the source consumer group. Network
 errors and HTTP 5xx responses remain pending and are retried; a permanent 404 is not retried.
 An image for which Extraction API definitively detects no head is also written to DLQ and
 acknowledged, because retrying the same immutable crop cannot change that result.
+Transient failures are retried at most `INTEREST_MAX_RETRIES` times (default `5`) and then
+also written to DLQ. New messages are read before a bounded batch of pending messages, so a
+failed record cannot starve the consumer group.
 
 Multiple heads from the same Extraction API response are filtered without additional API
 calls. A candidate is discarded when either side is less than `MIN_HEAD_SIZE` (default `30`
