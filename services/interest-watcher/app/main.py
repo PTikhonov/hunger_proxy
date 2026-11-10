@@ -110,12 +110,13 @@ local detail_object = cjson.decode(detail)
 local fired = 0
 for _, trigger in ipairs(triggers) do
   local threshold = tonumber(trigger.threshold)
-  if threshold and previous_category_total < threshold and threshold <= category_total then
-    local cooldown_seconds = math.max(1, tonumber(trigger.cooldown_seconds) or 1)
-    local cooldown_key = trigger.cooldown_key
-    if redis.call('SET', cooldown_key, now_iso, 'NX', 'EX', cooldown_seconds) then
+  if threshold and threshold <= category_total then
+    local crossed = previous_category_total < threshold
+    local evaluation_seconds = math.max(1, tonumber(trigger.evaluation_seconds) or 1)
+    local evaluation_key = trigger.evaluation_key
+    if crossed or redis.call('SET', evaluation_key, now_iso, 'NX', 'EX', evaluation_seconds) then
       local event = {
-        event_type = 'interest_threshold_crossed',
+        event_type = crossed and 'interest_threshold_crossed' or 'interest_threshold_active',
         occurred_at = now_iso,
         person_id = detail_object.person_id,
         location_id = detail_object.location_id,
@@ -135,7 +136,7 @@ for _, trigger in ipairs(triggers) do
         observation_stream_id = detail_object.observation_stream_id
       }
       redis.call('XADD', ARGV[8], 'MAXLEN', '~', ARGV[9], '*',
-        'event_type', 'interest_threshold_crossed',
+        'event_type', event.event_type,
         'payload', cjson.encode(event))
       fired = fired + 1
     end
@@ -579,9 +580,8 @@ def _threshold_rules(
     this worker's authoritative fact is the category-interest threshold crossing.
     """
     thresholds = payload.get("thresholds_seconds")
-    cooldowns = payload.get("cooldowns_seconds")
     rules = payload.get("rules")
-    if not isinstance(thresholds, dict) or not isinstance(cooldowns, dict) or not isinstance(rules, list):
+    if not isinstance(thresholds, dict) or not isinstance(rules, list):
         return []
     level_names = {1: "passed", 2: "attention", 3: "involved", 4: "buy"}
     revision = _number_or_none(payload.get("revision"))
@@ -604,11 +604,10 @@ def _threshold_rules(
         rule_id = _number_or_none(action.get("id")) or context_id
         if context_id is None or rule_id is None:
             continue
-        cooldown_seconds = _cooldown_seconds(action, cooldowns)
         threshold_label = format(float(threshold), "g")
-        cooldown_key = (
+        evaluation_key = (
             f"{settings.threshold_cooldown_prefix}:{person_id}:{location_id}:{category_id}:"
-            f"{int(context_id)}:{int(rule_id)}:{threshold_label}"
+            f"{interest_level}:{threshold_label}"
         )
         result.append({
             "context_id": int(context_id),
@@ -616,24 +615,12 @@ def _threshold_rules(
             "interest_lvl": interest_level,
             "priority": int(_number_or_none(rule.get("priority")) or 0),
             "threshold": threshold,
-            "cooldown_seconds": cooldown_seconds,
-            "cooldown_key": cooldown_key,
+            "evaluation_seconds": settings.offer_evaluation_interval_seconds,
+            "evaluation_key": evaluation_key,
             "rule_revision": int(revision) if revision is not None else None,
             "action": action,
         })
     return result
-
-
-def _cooldown_seconds(action: dict[str, Any], cooldowns: dict[str, Any]) -> int:
-    action_type = str(action.get("type") or "").lower()
-    if "audio" in action_type or "ауди" in action_type:
-        key = "audio"
-    elif "telegram" in action_type or "телеграм" in action_type:
-        key = "telegram"
-    else:
-        key = "video"
-    value = _number_or_none(cooldowns.get(key))
-    return max(1, int(value or 0))
 
 
 def _matched_category_id(shelf: dict[str, Any], direction: tuple[float, float, float]) -> int | None:

@@ -18,11 +18,12 @@ logger = logging.getLogger(settings.app_name)
 
 
 PUBLISH_OFFER_SCRIPT = """
-local created = redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', ARGV[2])
+if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
+local created = redis.call('SET', KEYS[2], ARGV[1], 'NX', 'EX', ARGV[2])
 if not created then return 0 end
-redis.call('SET', KEYS[2], ARGV[3], 'EX', ARGV[2])
-redis.call('XADD', ARGV[4], 'MAXLEN', '~', ARGV[5], '*',
-  'event_type', 'offer_generated', 'offer_id', ARGV[6], 'payload', ARGV[3])
+redis.call('SET', KEYS[3], ARGV[3], 'EX', ARGV[4])
+redis.call('XADD', ARGV[5], 'MAXLEN', '~', ARGV[6], '*',
+  'event_type', 'offer_generated', 'offer_id', ARGV[7], 'payload', ARGV[3])
 return 1
 """
 
@@ -86,8 +87,8 @@ class OfferGenerator:
 
     async def _process(self, message_id: str, fields: dict[str, str]) -> bool:
         event = _payload(fields)
-        if event.get("event_type") != "interest_threshold_crossed":
-            raise InvalidThresholdEvent("expected event_type=interest_threshold_crossed")
+        if event.get("event_type") not in {"interest_threshold_crossed", "interest_threshold_active"}:
+            raise InvalidThresholdEvent("expected an interest threshold event")
         person_id = _required_string(event, "person_id")
         location_id = _required_positive_int(event, "location_id")
         category_id = _required_positive_int(event, "matched_category_id")
@@ -103,45 +104,52 @@ class OfferGenerator:
         if promotion is None:
             return False
 
+        generated = False
         context_id = promotion["context_id"]
-        actions = promotion["actions"]
-        cooldown = _promotion_cooldown_seconds(rules_payload, actions)
-        ttl = max(settings.offer_min_dedupe_seconds, cooldown)
-        offer_id = _offer_id(person_id, location_id, category_id, context_id, threshold, revision)
-        offer = {
-            "schema_version": 1,
-            "event_type": "offer_generated",
-            "offer_id": offer_id,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "person_id": person_id,
-            "location_id": location_id,
-            "camera_id": str(event.get("camera_id") or ""),
-            "category_id": category_id,
-            "interest": {
-                "level": interest_level,
-                "threshold_seconds": threshold,
-                "previous_total_seconds": _number_or_none(event.get("previous_total_seconds")),
-                "total_seconds": _number_or_none(event.get("total_seconds")),
-            },
-            "demographics": _demographics(person),
-            "promotion": {
-                "context_id": context_id,
-                "priority": promotion["priority"],
-                "rules_revision": revision,
-            },
-            "cooldown_seconds": cooldown,
-            "actions": [_offer_action(action, rules_payload) for action in actions],
-            "source_threshold_event_id": message_id,
-            "source_event_id": str(event.get("source_event_id") or ""),
-        }
-        payload = json.dumps(offer, ensure_ascii=True, separators=(",", ":"))
-        dedupe_key = f"{settings.offer_dedupe_prefix}:{person_id}:{location_id}:{category_id}:{context_id}:{_number_label(threshold)}:{revision}"
-        published = await self.hot.eval(
-            PUBLISH_OFFER_SCRIPT, 2,
-            dedupe_key, f"{settings.offer_state_prefix}:{offer_id}",
-            message_id, ttl, payload, settings.output_stream, settings.output_maxlen, offer_id,
-        )
-        return bool(int(published))
+        for action in promotion["actions"]:
+            if not _action_is_active(action):
+                continue
+            offer_action = _offer_action(action, rules_payload)
+            action_id = _required_positive_int(offer_action, "action_id")
+            offer_id = _offer_id(message_id, action_id)
+            cooldown_key = f"{settings.action_cooldown_prefix}:{person_id}:{location_id}:{action_id}"
+            pending_key = f"{settings.action_pending_prefix}:{person_id}:{location_id}:{action_id}"
+            offer = {
+                "schema_version": 2,
+                "event_type": "offer_generated",
+                "offer_id": offer_id,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "person_id": person_id,
+                "location_id": location_id,
+                "camera_id": str(event.get("camera_id") or ""),
+                "category_id": category_id,
+                "interest": {
+                    "level": interest_level,
+                    "threshold_seconds": threshold,
+                    "previous_total_seconds": _number_or_none(event.get("previous_total_seconds")),
+                    "total_seconds": _number_or_none(event.get("total_seconds")),
+                },
+                "demographics": _demographics(person),
+                "promotion": {"context_id": context_id, "priority": promotion["priority"], "rules_revision": revision},
+                "actions": [offer_action],
+                "action_state": {
+                    "cooldown_key": cooldown_key,
+                    "pending_key": pending_key,
+                    "personal_cooldown_seconds": offer_action["personal_cooldown_seconds"],
+                },
+                "source_threshold_event_id": message_id,
+                "source_event_id": str(event.get("source_event_id") or ""),
+            }
+            payload = json.dumps(offer, ensure_ascii=True, separators=(",", ":"))
+            published = await self.hot.eval(
+                PUBLISH_OFFER_SCRIPT, 3,
+                cooldown_key, pending_key, f"{settings.offer_state_prefix}:{offer_id}",
+                offer_id, settings.action_pending_ttl_seconds, payload,
+                max(settings.action_pending_ttl_seconds, settings.offer_min_dedupe_seconds),
+                settings.output_stream, settings.output_maxlen, offer_id,
+            )
+            generated = generated or bool(int(published))
+        return generated
 
     async def _rules_payload(self, location_id: int, revision: int) -> dict[str, Any]:
         historical = await self.rules.get(
@@ -267,12 +275,6 @@ def _age_bucket(value: str) -> tuple[int, int] | None:
     return None
 
 
-def _promotion_cooldown_seconds(payload: dict[str, Any], actions: list[dict[str, Any]]) -> int:
-    cooldowns = payload.get("cooldowns_seconds") if isinstance(payload.get("cooldowns_seconds"), dict) else {}
-    values = [_number_or_none(cooldowns.get(_cooldown_kind(action))) or 0 for action in actions]
-    return max(1, *(int(value) for value in values))
-
-
 def _cooldown_kind(action: dict[str, Any]) -> str:
     action_type = str(action.get("type") or "").lower()
     if "telegram" in action_type or "телеграм" in action_type:
@@ -286,10 +288,29 @@ def _offer_action(action: dict[str, Any], rules_payload: dict[str, Any]) -> dict
     result = dict(action)
     result["action_id"] = action.get("id")
     result["delivery_type"] = _delivery_type(action)
-    cooldowns = rules_payload.get("cooldowns_seconds")
-    cooldowns = cooldowns if isinstance(cooldowns, dict) else {}
-    result["cooldown_seconds"] = max(1, int(_number_or_none(cooldowns.get(_cooldown_kind(action))) or 0))
+    cooldowns = rules_payload.get("cooldowns_seconds") if isinstance(rules_payload.get("cooldowns_seconds"), dict) else {}
+    channel_cooldowns = rules_payload.get("channel_cooldowns_seconds") if isinstance(rules_payload.get("channel_cooldowns_seconds"), dict) else {}
+    kind = _cooldown_kind(action)
+    result["personal_cooldown_seconds"] = max(1, int(_number_or_none(cooldowns.get(kind)) or 1))
+    result["channel_cooldown_seconds"] = max(1, int(_number_or_none(channel_cooldowns.get(kind)) or 1))
     return result
+
+
+def _action_is_active(action: dict[str, Any]) -> bool:
+    now = datetime.now(timezone.utc)
+    for name, comparison in (("active_from", lambda value: now < value), ("active_to", lambda value: now >= value)):
+        raw = action.get(name)
+        if not raw:
+            continue
+        try:
+            value = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        if comparison(value):
+            return False
+    return True
 
 
 def _delivery_type(action: dict[str, Any]) -> str:
@@ -318,8 +339,8 @@ def _demographics(person: dict[str, str]) -> dict[str, Any]:
     }
 
 
-def _offer_id(person_id: str, location_id: int, category_id: int, context_id: int, threshold: float, revision: int) -> str:
-    raw = f"{person_id}|{location_id}|{category_id}|{context_id}|{_number_label(threshold)}|{revision}"
+def _offer_id(source_message_id: str, action_id: int) -> str:
+    raw = f"{source_message_id}|{action_id}"
     return "offer:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 

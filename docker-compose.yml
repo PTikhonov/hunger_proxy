@@ -195,7 +195,8 @@ services:
       INTEREST_DEAD_LETTER_MAXLEN: ${INTEREST_DEAD_LETTER_MAXLEN:-10000}
       INTEREST_THRESHOLD_EVENTS_STREAM: ${INTEREST_THRESHOLD_EVENTS_STREAM:-stream:interest-threshold-events}
       INTEREST_THRESHOLD_EVENTS_MAXLEN: ${INTEREST_THRESHOLD_EVENTS_MAXLEN:-100000}
-      INTEREST_THRESHOLD_COOLDOWN_PREFIX: ${INTEREST_THRESHOLD_COOLDOWN_PREFIX:-interest-threshold:cooldown}
+      INTEREST_THRESHOLD_COOLDOWN_PREFIX: ${INTEREST_THRESHOLD_COOLDOWN_PREFIX:-interest-threshold:evaluation}
+      INTEREST_OFFER_EVALUATION_INTERVAL_SECONDS: ${INTEREST_OFFER_EVALUATION_INTERVAL_SECONDS:-1}
       PROMOTION_RULES_KEY_PREFIX: ${PROMOTION_RULES_KEY_PREFIX:-hunger:promotion-rules:location}
       INTEREST_GAP_SECONDS: ${INTEREST_GAP_SECONDS:-10}
       INTEREST_MISSES_BEFORE_RESET: ${INTEREST_MISSES_BEFORE_RESET:-3}
@@ -240,6 +241,9 @@ services:
       OFFER_DEDUPE_PREFIX: ${OFFER_DEDUPE_PREFIX:-offer:dedupe}
       OFFER_STATE_PREFIX: ${OFFER_STATE_PREFIX:-offer}
       OFFER_MIN_DEDUPE_SECONDS: ${OFFER_MIN_DEDUPE_SECONDS:-60}
+      OFFER_ACTION_COOLDOWN_PREFIX: ${OFFER_ACTION_COOLDOWN_PREFIX:-offer-action:cooldown}
+      OFFER_ACTION_PENDING_PREFIX: ${OFFER_ACTION_PENDING_PREFIX:-offer-action:pending}
+      OFFER_ACTION_PENDING_TTL_SECONDS: ${OFFER_ACTION_PENDING_TTL_SECONDS:-900}
       LOG_LEVEL: ${LOG_LEVEL:-DEBUG}
     depends_on:
       redis-hot-state:
@@ -271,6 +275,71 @@ services:
       HTTP_PROXY: ${TELEGRAM_HTTP_PROXY:-http://192.168.1.25:12334}
       HTTPS_PROXY: ${TELEGRAM_HTTPS_PROXY:-http://192.168.1.25:12334}
       NO_PROXY: localhost,127.0.0.1,redis-hot-state,redis-streams
+      LOG_LEVEL: ${LOG_LEVEL:-DEBUG}
+    depends_on:
+      redis-hot-state:
+        condition: service_healthy
+
+  xibo-audio-delivery:
+    build:
+      context: ./services/xibo-audio-delivery
+    restart: unless-stopped
+    environment:
+      APP_NAME: xibo-audio-delivery
+      XIBO_DELIVERY_ENABLED: ${XIBO_AUDIO_DELIVERY_ENABLED:-false}
+      XIBO_DELIVERY_TYPE: xibo_audio
+      XIBO_DELIVERY_LABEL: audio
+      XIBO_DELIVERY_CONSUMER_GROUP: ${XIBO_AUDIO_DELIVERY_CONSUMER_GROUP:-xibo-audio-delivery}
+      XIBO_DELIVERY_BATCH_SIZE: ${XIBO_DELIVERY_BATCH_SIZE:-10}
+      XIBO_DELIVERY_BLOCK_MS: ${XIBO_DELIVERY_BLOCK_MS:-5000}
+      XIBO_DELIVERY_PENDING_IDLE_MS: ${XIBO_DELIVERY_PENDING_IDLE_MS:-30000}
+      XIBO_DELIVERY_DEAD_LETTER_STREAM: ${XIBO_AUDIO_DELIVERY_DEAD_LETTER_STREAM:-stream:xibo-audio-delivery-dead-letter}
+      XIBO_DELIVERY_DEAD_LETTER_MAXLEN: ${XIBO_DELIVERY_DEAD_LETTER_MAXLEN:-10000}
+      XIBO_DELIVERY_SENT_KEY_PREFIX: ${XIBO_AUDIO_DELIVERY_SENT_KEY_PREFIX:-delivery:xibo:audio:sent}
+      XIBO_DELIVERY_COOLDOWN_KEY_PREFIX: ${XIBO_AUDIO_DELIVERY_COOLDOWN_KEY_PREFIX:-delivery:xibo:audio:cooldown}
+      XIBO_DELIVERY_SENT_TTL_SECONDS: ${XIBO_DELIVERY_SENT_TTL_SECONDS:-604800}
+      XIBO_TIMEOUT_SECONDS: ${XIBO_TIMEOUT_SECONDS:-10}
+      # Used until hunger-head includes delivery.xibo in its versioned rules snapshot.
+      XIBO_CMS_URL: ${XIBO_CMS_URL:-}
+      XIBO_CLIENT_ID: ${XIBO_CLIENT_ID:-}
+      XIBO_CLIENT_SECRET: ${XIBO_CLIENT_SECRET:-}
+      REDIS_HOT_STATE_URL: redis://redis-hot-state:6379/0
+      REDIS_RULES_URL: redis://redis-hot-state:6379/1
+      OFFERS_STREAM: ${OFFERS_STREAM:-stream:offers}
+      PROMOTION_RULES_KEY_PREFIX: ${PROMOTION_RULES_KEY_PREFIX:-hunger:promotion-rules:location}
+      PROMOTION_RULES_REVISION_KEY_PREFIX: ${PROMOTION_RULES_REVISION_KEY_PREFIX:-hunger:promotion-rules:location}
+      LOG_LEVEL: ${LOG_LEVEL:-DEBUG}
+    depends_on:
+      redis-hot-state:
+        condition: service_healthy
+
+  xibo-video-delivery:
+    build:
+      context: ./services/xibo-audio-delivery
+    restart: unless-stopped
+    environment:
+      APP_NAME: xibo-video-delivery
+      XIBO_DELIVERY_ENABLED: ${XIBO_VIDEO_DELIVERY_ENABLED:-false}
+      XIBO_DELIVERY_TYPE: xibo_video
+      XIBO_DELIVERY_LABEL: video
+      XIBO_DELIVERY_CONSUMER_GROUP: ${XIBO_VIDEO_DELIVERY_CONSUMER_GROUP:-xibo-video-delivery}
+      XIBO_DELIVERY_BATCH_SIZE: ${XIBO_DELIVERY_BATCH_SIZE:-10}
+      XIBO_DELIVERY_BLOCK_MS: ${XIBO_DELIVERY_BLOCK_MS:-5000}
+      XIBO_DELIVERY_PENDING_IDLE_MS: ${XIBO_DELIVERY_PENDING_IDLE_MS:-30000}
+      XIBO_DELIVERY_DEAD_LETTER_STREAM: ${XIBO_VIDEO_DELIVERY_DEAD_LETTER_STREAM:-stream:xibo-video-delivery-dead-letter}
+      XIBO_DELIVERY_DEAD_LETTER_MAXLEN: ${XIBO_DELIVERY_DEAD_LETTER_MAXLEN:-10000}
+      XIBO_DELIVERY_SENT_KEY_PREFIX: ${XIBO_VIDEO_DELIVERY_SENT_KEY_PREFIX:-delivery:xibo:video:sent}
+      XIBO_DELIVERY_COOLDOWN_KEY_PREFIX: ${XIBO_VIDEO_DELIVERY_COOLDOWN_KEY_PREFIX:-delivery:xibo:video:cooldown}
+      XIBO_DELIVERY_SENT_TTL_SECONDS: ${XIBO_DELIVERY_SENT_TTL_SECONDS:-604800}
+      XIBO_TIMEOUT_SECONDS: ${XIBO_TIMEOUT_SECONDS:-10}
+      XIBO_CMS_URL: ${XIBO_CMS_URL:-}
+      XIBO_CLIENT_ID: ${XIBO_CLIENT_ID:-}
+      XIBO_CLIENT_SECRET: ${XIBO_CLIENT_SECRET:-}
+      REDIS_HOT_STATE_URL: redis://redis-hot-state:6379/0
+      REDIS_RULES_URL: redis://redis-hot-state:6379/1
+      OFFERS_STREAM: ${OFFERS_STREAM:-stream:offers}
+      PROMOTION_RULES_KEY_PREFIX: ${PROMOTION_RULES_KEY_PREFIX:-hunger:promotion-rules:location}
+      PROMOTION_RULES_REVISION_KEY_PREFIX: ${PROMOTION_RULES_REVISION_KEY_PREFIX:-hunger:promotion-rules:location}
       LOG_LEVEL: ${LOG_LEVEL:-DEBUG}
     depends_on:
       redis-hot-state:

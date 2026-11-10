@@ -121,6 +121,7 @@ class PromotionRulesSnapshot(BaseModel):
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     thresholds_seconds: dict[str, int | float]
     cooldowns_seconds: dict[str, int | float]
+    channel_cooldowns_seconds: dict[str, int | float]
     # Per-location delivery configuration. Credentials stay in this immutable
     # rules snapshot and are never copied into the offer stream.
     delivery: dict[str, Any] = Field(default_factory=dict)

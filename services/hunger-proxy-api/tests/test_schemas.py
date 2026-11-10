@@ -26,6 +26,7 @@ def test_promotion_rules_snapshot_accepts_complete_location_rules() -> None:
         revision=2,
         thresholds_seconds={"passed": 1, "attention": 5, "involved": 15, "buy": 45},
         cooldowns_seconds={"audio": 120, "video": 60, "telegram": 10},
+        channel_cooldowns_seconds={"audio": 5, "video": 5, "telegram": 1},
         rules=[],
     )
     assert snapshot.location_id == 1

@@ -82,7 +82,7 @@ class TelegramDelivery:
         delivered = 0
         for action in telegram_actions:
             try:
-                sent = await self._deliver_action(offer_id, action, telegram)
+                sent = await self._deliver_action(offer_id, action, telegram, offer.get("action_state"))
             except InvalidOffer as exc:
                 await self._dead_letter_action(message_id, offer, action, str(exc))
                 continue
@@ -118,7 +118,9 @@ class TelegramDelivery:
             "chat_id": _required_string(telegram, "chat_id"),
         }
 
-    async def _deliver_action(self, offer_id: str, action: dict[str, Any], telegram: dict[str, str]) -> bool:
+    async def _deliver_action(
+        self, offer_id: str, action: dict[str, Any], telegram: dict[str, str], action_state: Any,
+    ) -> bool:
         action_id = _required_action_id(action)
         chat_id = telegram["chat_id"]
         text = _required_string(action, "content")
@@ -126,11 +128,12 @@ class TelegramDelivery:
         if await self.redis.exists(sent_key):
             return False
 
-        cooldown = max(1, _positive_int(action.get("cooldown_seconds"), 1))
+        cooldown = max(1, _positive_int(action.get("channel_cooldown_seconds"), 1))
         cooldown_key = f"{settings.cooldown_key_prefix}:{chat_id}"
         reserved = await self.redis.set(cooldown_key, offer_id, nx=True, ex=cooldown)
         if not reserved:
             logger.info("Telegram action skipped by chat cooldown offer_id=%s action_id=%s chat_id=%s", offer_id, action_id, chat_id)
+            await self._clear_pending(action_state, offer_id)
             return False
         try:
             response = await self.http.post(
@@ -152,7 +155,30 @@ class TelegramDelivery:
             json.dumps({"sent_at": datetime.now(timezone.utc).isoformat(), "chat_id": chat_id}),
             ex=settings.sent_ttl_seconds,
         )
+        await self._mark_personal_cooldown(action_state, offer_id)
         return True
+
+    async def _clear_pending(self, action_state: Any, offer_id: str) -> None:
+        if not isinstance(action_state, dict):
+            return
+        pending_key = str(action_state.get("pending_key") or "")
+        if pending_key and await self.redis.get(pending_key) == offer_id:
+            await self.redis.delete(pending_key)
+
+    async def _mark_personal_cooldown(self, action_state: Any, offer_id: str) -> None:
+        if not isinstance(action_state, dict):
+            return
+        cooldown_key = str(action_state.get("cooldown_key") or "")
+        pending_key = str(action_state.get("pending_key") or "")
+        seconds = _positive_int(action_state.get("personal_cooldown_seconds"), 1)
+        if cooldown_key:
+            await self.redis.set(
+                cooldown_key,
+                json.dumps({"offer_id": offer_id, "delivered_at": datetime.now(timezone.utc).isoformat()}),
+                ex=seconds,
+            )
+        if pending_key and await self.redis.get(pending_key) == offer_id:
+            await self.redis.delete(pending_key)
 
     async def _dead_letter_action(
         self, message_id: str, offer: dict[str, Any], action: dict[str, Any], reason: str,

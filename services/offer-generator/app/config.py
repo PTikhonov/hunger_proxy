@@ -27,6 +27,9 @@ class Settings:
     offer_dedupe_prefix: str = os.getenv("OFFER_DEDUPE_PREFIX", "offer:dedupe")
     offer_state_prefix: str = os.getenv("OFFER_STATE_PREFIX", "offer")
     offer_min_dedupe_seconds: int = int(os.getenv("OFFER_MIN_DEDUPE_SECONDS", "60"))
+    action_cooldown_prefix: str = os.getenv("OFFER_ACTION_COOLDOWN_PREFIX", "offer-action:cooldown")
+    action_pending_prefix: str = os.getenv("OFFER_ACTION_PENDING_PREFIX", "offer-action:pending")
+    action_pending_ttl_seconds: int = int(os.getenv("OFFER_ACTION_PENDING_TTL_SECONDS", "900"))
     log_level: str = os.getenv("LOG_LEVEL", "INFO").upper()
 
 
