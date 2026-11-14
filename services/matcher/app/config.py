@@ -34,6 +34,9 @@ class Settings:
     matcher_lookback_seconds: float = float(os.getenv("MATCHER_LOOKBACK_SECONDS", "10"))
     matcher_lookahead_seconds: float = float(os.getenv("MATCHER_LOOKAHEAD_SECONDS", "2"))
     matcher_observation_ttl_seconds: int = int(os.getenv("MATCHER_OBSERVATION_TTL_SECONDS", "600"))
+    matcher_pending_silhouette_ttl_seconds: int = int(
+        os.getenv("MATCHER_PENDING_SILHOUETTE_TTL_SECONDS", "30")
+    )
     matcher_face_body_confidence_threshold: float = float(os.getenv("MATCHER_FACE_BODY_CONFIDENCE_THRESHOLD", "0.78"))
     matcher_face_detection_quality_threshold: float = float(
         os.getenv("MATCHER_FACE_DETECTION_QUALITY_THRESHOLD", "0.60")

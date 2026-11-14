@@ -42,9 +42,12 @@ def gaze_vector(yaw_degrees: float, pitch_degrees: float, roll_degrees: float = 
     """Convert Extraction API head pose to the camera-coordinate forward vector.
 
     Camera coordinates use X to the image right, Y down and Z away from the
-    camera. Extraction API's image axes are inverted relative to these camera
-    axes, so invert yaw and pitch while keeping a frontal pose along +Z.
-    Roll rotates around the forward axis and does not change that axis.
+    camera. A frontal face looks towards the camera, therefore its gaze has a
+    negative Z component. Extraction API's yaw and pitch signs are inverted
+    relative to the camera image axes; only the depth direction is opposite to
+    the previously used camera-forward vector. In particular, a negative yaw
+    points towards the image right, while Z points from the head to the camera.
+    Roll rotates the head around its forward axis and does not change that axis.
     """
     del roll_degrees
     yaw = math.radians(yaw_degrees)
@@ -53,7 +56,7 @@ def gaze_vector(yaw_degrees: float, pitch_degrees: float, roll_degrees: float = 
         (
             -math.sin(yaw) * math.cos(pitch),
             -math.sin(pitch),
-            math.cos(yaw) * math.cos(pitch),
+            -math.cos(yaw) * math.cos(pitch),
         )
     )
 
@@ -80,8 +83,8 @@ def head_point(camera: dict[str, Any], bbox: Sequence[float], head_height_meters
 def project_point(camera: dict[str, Any], point: Sequence[float]) -> tuple[float, float]:
     """Project a camera-coordinate 3D point to full-frame pixel coordinates."""
     x, y, z = (float(value) for value in point)
-    if z <= EPSILON:
-        raise ValueError("point must be in front of the camera")
+    if abs(z) <= EPSILON:
+        raise ValueError("point must not lie on the camera projection plane")
     frame_width = float(camera["frame_width"])
     frame_height = float(camera["frame_height"])
     focal = float(camera["focal_length_in_mm"])
@@ -109,6 +112,39 @@ def project_direction(camera: dict[str, Any], direction: Sequence[float]) -> tup
         x * focal * frame_width / (z * sensor_width),
         y * focal * frame_height / (z * sensor_height),
     )
+
+
+def project_ray_direction(
+    camera: dict[str, Any],
+    origin: Sequence[float],
+    direction: Sequence[float],
+) -> tuple[float, float]:
+    """Return the screen-space direction of a real gaze ray from its origin.
+
+    The gaze ray goes towards the camera (negative Z).  Its vanishing point
+    obtained from ``direction.x / direction.z`` therefore points in the
+    opposite on-screen direction to an object between the head and camera.
+    Projecting a finite point on the ray gives the direction that viewers see
+    in the image and that is used for shelf intersection.
+    """
+    ox, oy, oz = (float(value) for value in origin)
+    dx, dy, dz = (float(value) for value in direction)
+    if oz <= EPSILON:
+        raise ValueError("ray origin must be in front of the camera")
+    if dz < -EPSILON:
+        target_z = oz / 2.0
+        scale = (target_z - oz) / dz
+    elif dz > EPSILON:
+        target_z = oz * 1.5
+        scale = (target_z - oz) / dz
+    else:
+        scale = 1.0
+        target_z = oz + dz * scale
+    if target_z <= EPSILON:
+        raise ValueError("ray projection target must be in front of the camera")
+    origin_px = project_point(camera, (ox, oy, oz))
+    target_px = project_point(camera, add_scaled((ox, oy, oz), (dx, dy, dz), scale))
+    return target_px[0] - origin_px[0], target_px[1] - origin_px[1]
 
 
 def ray_intersects_shelf(

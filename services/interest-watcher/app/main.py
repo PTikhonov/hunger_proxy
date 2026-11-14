@@ -14,7 +14,7 @@ from redis.exceptions import ResponseError
 
 from app.config import settings
 from app.extraction import ExtractionClient, HeadNotDetectedError
-from app.geometry import gaze_vector, head_point, project_direction, project_point, ray_intersects_shelf, viewing_side
+from app.geometry import gaze_vector, head_point, project_point, project_ray_direction, ray_intersects_shelf, viewing_side
 
 
 logger = logging.getLogger(settings.app_name)
@@ -366,7 +366,7 @@ class InterestWatcher:
             "head_point": head_point_3d,
             "head_distance_m": head_point_3d[2],
             "gaze_vector": gaze_direction,
-            "gaze_direction_px": project_direction(camera, gaze_direction),
+            "gaze_direction_px": project_ray_direction(camera, head_point_3d, gaze_direction),
             "shelves": shelves,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }

@@ -196,7 +196,8 @@ class MatcherService:
                 )
                 person_id = await self._upsert_silhouette_person(message_id, observation)
                 await self._publish_silhouette_person_observation(message_id, observation, person_id)
-                await self._index_silhouette_observation(message_id, observation)
+                await self._index_silhouette_observation(message_id, observation, person_id)
+                await self._mark_pending_silhouette(message_id, observation, person_id)
                 await self._stream.ack(message_id)
                 return
 
@@ -274,6 +275,10 @@ class MatcherService:
         identity_fields = await self._hot_state_redis.hgetall(f"identity:{face_identity_id}")
         person_id = str(identity_fields.get("person_id") or "")
         if person_id and await self._hot_state_redis.exists(person_id):
+            event_epoch = _event_epoch(observation)
+            camera_id = str(observation.get("camera_id") or "")
+            if event_epoch is not None and camera_id and await self._pending_silhouette_candidates(camera_id, event_epoch):
+                return True, "linked_face_for_pending_silhouette"
             return False, "already_linked_to_live_person"
 
         now = time()
@@ -407,7 +412,12 @@ class MatcherService:
         if len(mapping) > 1:
             await self._hot_state_redis.hset(person_id, mapping=mapping)
 
-    async def _index_silhouette_observation(self, message_id: str, observation: dict[str, Any]) -> None:
+    async def _index_silhouette_observation(
+        self,
+        message_id: str,
+        observation: dict[str, Any],
+        person_id: str | None,
+    ) -> None:
         event_epoch = _event_epoch(observation)
         camera_id = str(observation.get("camera_id") or "")
         identity_id = str(observation.get("identity_id") or "")
@@ -420,6 +430,7 @@ class MatcherService:
             "observation_id": message_id,
             "payload": json.dumps(observation, ensure_ascii=True),
             "identity_id": identity_id,
+            "person_id": str(person_id or ""),
             "detection_type": "silhouette",
             "new_body": "true" if _bool(observation.get("new_body")) else "false",
             "camera_id": camera_id,
@@ -435,6 +446,50 @@ class MatcherService:
         await self._hot_state_redis.hset(observation_key, mapping=mapping)
         await self._hot_state_redis.expire(observation_key, settings.matcher_observation_ttl_seconds)
         await self._hot_state_redis.zadd(index_key, {message_id: event_epoch})
+        await self._hot_state_redis.expire(index_key, settings.matcher_observation_ttl_seconds)
+
+    async def _mark_pending_silhouette(
+        self,
+        message_id: str,
+        observation: dict[str, Any],
+        person_id: str | None,
+    ) -> None:
+        """Keep the latest image of an unmatched silhouette available for a face bridge.
+
+        The silhouette person is intentionally created before this marker.  A
+        later matching face must only establish a relation between two existing
+        persons, never transfer either identity or its interest counters.
+        """
+        identity_id = str(observation.get("identity_id") or "")
+        camera_id = str(observation.get("camera_id") or "")
+        event_epoch = _event_epoch(observation)
+        if not identity_id or not camera_id or event_epoch is None or not person_id:
+            return
+
+        identity_fields = await self._hot_state_redis.hgetall(f"identity:{identity_id}")
+        if identity_fields.get("matched_face_identity_id") or identity_fields.get("person_link_status") == "confirmed":
+            return
+
+        media_info = _normalized_media_info(observation.get("media"))
+        marker_key = _pending_silhouette_key(identity_id)
+        mapping = {
+            "observation_id": message_id,
+            "payload": json.dumps(observation, ensure_ascii=True),
+            "identity_id": identity_id,
+            "person_id": person_id,
+            "camera_id": camera_id,
+            "event_epoch": str(event_epoch),
+            "event_timestamp": str(observation.get("event_timestamp") or ""),
+            "source_event_id": str(observation.get("source_event_id") or ""),
+            "normalized_redis_key": str(media_info.get("redis_key") or ""),
+            "normalized_public_url": str(media_info.get("public_url") or media_info.get("upload_url") or ""),
+            "normalized_content_type": str(media_info.get("content_type") or "image/jpeg"),
+            "normalized_filename": str(media_info.get("filename") or "normalized.jpg"),
+        }
+        index_key = _pending_silhouettes_index_key(camera_id)
+        await self._hot_state_redis.hset(marker_key, mapping=mapping)
+        await self._hot_state_redis.expire(marker_key, settings.matcher_pending_silhouette_ttl_seconds)
+        await self._hot_state_redis.zadd(index_key, {identity_id: event_epoch})
         await self._hot_state_redis.expire(index_key, settings.matcher_observation_ttl_seconds)
 
     async def _publish_silhouette_person_observation(
@@ -486,20 +541,31 @@ class MatcherService:
         if not face_identity_id or not camera_id:
             return
 
-        candidate_ids = await self._candidate_ids(camera_id, pending.event_epoch)
-        if not candidate_ids:
+        face_fields = await self._hot_state_redis.hgetall(f"identity:{face_identity_id}")
+        face_person_id = str(face_fields.get("person_id") or "")
+        face_has_live_person = bool(face_person_id and await self._hot_state_redis.exists(face_person_id))
+        if face_has_live_person:
+            candidates = await self._pending_silhouette_candidates(camera_id, pending.event_epoch)
+            match_mode = "person_link"
+        else:
+            candidate_ids = await self._candidate_ids(camera_id, pending.event_epoch)
+            candidates = await self._load_candidates(candidate_ids, pending.event_epoch)
+            match_mode = "identity_match"
+
+        if not candidates:
             logger.info("No silhouette candidates face_identity_id=%s camera_id=%s", face_identity_id, camera_id)
             return
 
-        candidates = await self._load_candidates(candidate_ids, pending.event_epoch)
         logger.debug(
-            "Loaded silhouette candidates for face face_identity_id=%s camera_id=%s count=%s window=[-%ss,+%ss]",
+            "Loaded silhouette candidates for face face_identity_id=%s camera_id=%s mode=%s count=%s window=[-%ss,+%ss]",
             face_identity_id,
             camera_id,
+            match_mode,
             len(candidates),
             settings.matcher_lookback_seconds,
             settings.matcher_lookahead_seconds,
         )
+        matches: list[tuple[float, CandidateFace, dict[str, str]]] = []
         for candidate in candidates:
             candidate_face = await self._face_embedding_from_silhouette(pending, candidate)
             if not candidate_face:
@@ -533,21 +599,48 @@ class MatcherService:
                 )
                 continue
 
-            person_id = await self._write_match(pending, candidate, similarity)
+            matches.append((similarity, candidate_face, candidate))
+
+        if not matches:
             logger.info(
-                "Matched face_identity_id=%s silhouette_identity_id=%s person_id=%s similarity=%.6f quality=%.6f",
+                "No matching silhouette passed threshold face_identity_id=%s candidates=%s",
                 face_identity_id,
+                len(candidates),
+            )
+            return
+
+        similarity, candidate_face, candidate = max(matches, key=lambda item: item[0])
+        candidate_person_id = str(candidate.get("person_id") or "")
+        if face_has_live_person and candidate_person_id and candidate_person_id != face_person_id:
+            await self._confirm_person_link(
+                face_person_id=face_person_id,
+                silhouette_person_id=candidate_person_id,
+                pending=pending,
+                candidate=candidate,
+                similarity=similarity,
+                quality=candidate_face.quality,
+            )
+            logger.info(
+                "Confirmed person link face_identity_id=%s face_person_id=%s silhouette_identity_id=%s "
+                "silhouette_person_id=%s similarity=%.6f quality=%.6f",
+                face_identity_id,
+                face_person_id,
                 candidate.get("identity_id"),
-                person_id,
+                candidate_person_id,
                 similarity,
                 candidate_face.quality,
             )
             return
 
+        person_id = await self._write_match(pending, candidate, similarity)
+        await self._clear_pending_silhouette(candidate)
         logger.info(
-            "No matching silhouette passed threshold face_identity_id=%s candidates=%s",
+            "Matched face_identity_id=%s silhouette_identity_id=%s person_id=%s similarity=%.6f quality=%.6f",
             face_identity_id,
-            len(candidates),
+            candidate.get("identity_id"),
+            person_id,
+            similarity,
+            candidate_face.quality,
         )
 
     async def _candidate_ids(self, camera_id: str, event_epoch: float) -> list[str]:
@@ -572,11 +665,174 @@ class MatcherService:
         candidates.sort(key=lambda item: float(item.get("time_distance") or 0.0))
         return candidates
 
+    async def _pending_silhouette_candidates(self, camera_id: str, face_epoch: float) -> list[dict[str, str]]:
+        """Return unresolved silhouette persons near a face observation in time."""
+        index_key = _pending_silhouettes_index_key(camera_id)
+        start = face_epoch - settings.matcher_lookback_seconds
+        stop = face_epoch + settings.matcher_lookahead_seconds
+        identity_ids = await self._hot_state_redis.zrangebyscore(index_key, start, stop)
+        candidates: list[dict[str, str]] = []
+        for identity_id in identity_ids:
+            fields = await self._hot_state_redis.hgetall(_pending_silhouette_key(str(identity_id)))
+            if not fields:
+                await self._hot_state_redis.zrem(index_key, identity_id)
+                continue
+            try:
+                event_epoch = float(fields.get("event_epoch") or 0.0)
+            except ValueError:
+                continue
+            fields["time_distance"] = str(abs(event_epoch - face_epoch))
+            candidates.append(fields)
+        candidates.sort(key=lambda item: float(item.get("time_distance") or 0.0))
+        return candidates
+
+    async def _clear_pending_silhouette(self, candidate: dict[str, str]) -> None:
+        identity_id = str(candidate.get("identity_id") or "")
+        camera_id = str(candidate.get("camera_id") or "")
+        if not identity_id:
+            return
+        await self._hot_state_redis.delete(_pending_silhouette_key(identity_id))
+        if camera_id:
+            await self._hot_state_redis.zrem(_pending_silhouettes_index_key(camera_id), identity_id)
+
+    async def _confirm_person_link(
+        self,
+        *,
+        face_person_id: str,
+        silhouette_person_id: str,
+        pending: PendingFace,
+        candidate: dict[str, str],
+        similarity: float,
+        quality: float,
+    ) -> None:
+        """Record a face-proven relation while preserving both person records.
+
+        This deliberately does not write either identity's ``person_id``.  P1
+        and P2 retain independent interests and reaction eligibility; analytics
+        can later resolve the immutable evidence-backed relation.
+        """
+        face_identity_id = str(pending.observation.get("identity_id") or "")
+        silhouette_identity_id = str(candidate.get("identity_id") or "")
+        camera_id = str(pending.observation.get("camera_id") or candidate.get("camera_id") or "")
+        if not face_identity_id or not silhouette_identity_id or not camera_id:
+            raise ValueError("person link requires face, silhouette and camera identifiers")
+
+        now = datetime.now(timezone.utc).isoformat()
+        face_person = await self._hot_state_redis.hgetall(face_person_id)
+        silhouette_person = await self._hot_state_redis.hgetall(silhouette_person_id)
+        face_related = _append_unique(
+            _json_string_list(face_person.get("confirmed_related_person_ids")),
+            silhouette_person_id,
+        )
+        silhouette_related = _append_unique(
+            _json_string_list(silhouette_person.get("confirmed_related_person_ids")),
+            face_person_id,
+        )
+        relation_key = _person_link_key(face_person_id, silhouette_person_id)
+        relation_mapping = {
+            "status": "confirmed",
+            "person_id_a": min(face_person_id, silhouette_person_id),
+            "person_id_b": max(face_person_id, silhouette_person_id),
+            "face_person_id": face_person_id,
+            "silhouette_person_id": silhouette_person_id,
+            "face_identity_id": face_identity_id,
+            "silhouette_identity_id": silhouette_identity_id,
+            "face_observation_id": pending.message_id,
+            "silhouette_observation_id": str(candidate.get("observation_id") or ""),
+            "face_source_event_id": str(pending.observation.get("source_event_id") or ""),
+            "silhouette_source_event_id": str(candidate.get("source_event_id") or ""),
+            "camera_id": camera_id,
+            "similarity": str(similarity),
+            "face_detection_quality": str(quality),
+            "linked_at": now,
+        }
+        await self._hot_state_redis.hset(relation_key, mapping=relation_mapping)
+        await self._hot_state_redis.expire(relation_key, settings.person_ttl_seconds)
+        await self._hot_state_redis.hset(
+            face_person_id,
+            mapping={
+                "confirmed_related_person_ids": json.dumps(face_related, ensure_ascii=True),
+                "last_confirmed_person_link_id": silhouette_person_id,
+                "last_confirmed_person_link_at": now,
+                "updated_at": now,
+            },
+        )
+        await self._hot_state_redis.hset(
+            silhouette_person_id,
+            mapping={
+                "confirmed_related_person_ids": json.dumps(silhouette_related, ensure_ascii=True),
+                "last_confirmed_person_link_id": face_person_id,
+                "last_confirmed_person_link_at": now,
+                "updated_at": now,
+            },
+        )
+        await self._hot_state_redis.expire(face_person_id, settings.person_ttl_seconds)
+        await self._hot_state_redis.expire(silhouette_person_id, settings.person_ttl_seconds)
+        await self._hot_state_redis.hset(
+            f"identity:{face_identity_id}",
+            mapping={
+                "confirmed_related_person_ids": json.dumps(face_related, ensure_ascii=True),
+                "last_confirmed_person_link_at": now,
+            },
+        )
+        await self._hot_state_redis.hset(
+            f"identity:{silhouette_identity_id}",
+            mapping={
+                "person_link_status": "confirmed",
+                "related_person_id": face_person_id,
+                "related_face_identity_id": face_identity_id,
+                "person_link_similarity": str(similarity),
+                "person_linked_at": now,
+            },
+        )
+        await self._clear_pending_silhouette(candidate)
+
+        event_payload = {
+            "event_type": "person_link_confirmed",
+            "person_id": face_person_id,
+            "related_person_id": silhouette_person_id,
+            "face_identity_id": face_identity_id,
+            "silhouette_identity_id": silhouette_identity_id,
+            "camera_id": camera_id,
+            "match_confidence": similarity,
+            "face_detection_quality": quality,
+            "linked_at": now,
+        }
+        await self._stream.append_person_event(
+            {
+                "event_type": "person_link_confirmed",
+                "person_id": face_person_id,
+                "related_person_id": silhouette_person_id,
+                "face_identity_id": face_identity_id,
+                "silhouette_identity_id": silhouette_identity_id,
+                "camera_id": camera_id,
+                "match_confidence": str(similarity),
+                "payload": json.dumps(event_payload, ensure_ascii=True),
+            }
+        )
+
     async def _face_embedding_from_silhouette(
         self,
         pending: PendingFace,
         candidate: dict[str, str],
     ) -> CandidateFace | None:
+        observation_id = str(candidate.get("observation_id") or "")
+        cache_key = _silhouette_face_embedding_cache_key(observation_id) if observation_id else ""
+        if cache_key:
+            cached = await self._hot_state_redis.hgetall(cache_key)
+            if cached:
+                if cached.get("status") != "found":
+                    return None
+                try:
+                    embedding = json.loads(cached.get("embedding") or "[]")
+                    quality = float(cached.get("quality") or 0.0)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    embedding = []
+                    quality = 0.0
+                if isinstance(embedding, list) and quality >= settings.matcher_face_detection_quality_threshold:
+                    return CandidateFace(embedding=[float(item) for item in embedding], quality=quality)
+                return None
+
         image_bytes = await self._load_candidate_image(candidate)
         if not image_bytes:
             logger.debug(
@@ -586,6 +842,7 @@ class MatcherService:
                 candidate.get("observation_id"),
                 candidate.get("identity_id"),
             )
+            await self._cache_silhouette_face_result(cache_key, None)
             return None
 
         try:
@@ -603,6 +860,7 @@ class MatcherService:
                 candidate.get("identity_id"),
                 candidate.get("camera_id"),
             )
+            await self._cache_silhouette_face_result(cache_key, None)
             return None
         except ValueError as exc:
             logger.debug(
@@ -614,6 +872,7 @@ class MatcherService:
                 candidate.get("camera_id"),
                 exc,
             )
+            await self._cache_silhouette_face_result(cache_key, None)
             return None
         except Exception:
             logger.debug(
@@ -624,9 +883,11 @@ class MatcherService:
                 candidate.get("identity_id"),
                 exc_info=True,
             )
+            await self._cache_silhouette_face_result(cache_key, None)
             return None
 
         quality = float(extraction.confidence or 0.0)
+        await self._cache_silhouette_face_result(cache_key, CandidateFace(extraction.embedding, quality))
         if quality < settings.matcher_face_detection_quality_threshold:
             logger.debug(
                 "Face from silhouette below quality threshold face_observation_id=%s silhouette_observation_id=%s "
@@ -640,6 +901,18 @@ class MatcherService:
             return None
 
         return CandidateFace(embedding=extraction.embedding, quality=quality)
+
+    async def _cache_silhouette_face_result(self, cache_key: str, result: CandidateFace | None) -> None:
+        if not cache_key:
+            return
+        mapping = {"status": "found" if result is not None else "not_found"}
+        if result is not None:
+            mapping.update({
+                "embedding": json.dumps(result.embedding, ensure_ascii=True),
+                "quality": str(result.quality),
+            })
+        await self._hot_state_redis.hset(cache_key, mapping=mapping)
+        await self._hot_state_redis.expire(cache_key, settings.matcher_observation_ttl_seconds)
 
     async def _load_candidate_image(self, candidate: dict[str, str]) -> bytes | None:
         redis_key = candidate.get("normalized_redis_key")
@@ -834,6 +1107,23 @@ class MatcherService:
             silhouette_identity_ids,
         )
         return person_id
+
+
+def _pending_silhouette_key(silhouette_identity_id: str) -> str:
+    return f"matcher_pending_silhouette:{silhouette_identity_id}"
+
+
+def _pending_silhouettes_index_key(camera_id: str) -> str:
+    return f"matcher_camera_pending_silhouettes:{camera_id}"
+
+
+def _silhouette_face_embedding_cache_key(observation_id: str) -> str:
+    return f"matcher_silhouette_face_embedding:{observation_id}"
+
+
+def _person_link_key(left_person_id: str, right_person_id: str) -> str:
+    first, second = sorted((left_person_id, right_person_id))
+    return f"person_link:{first}:{second}"
 
 
 def _bool(value: Any) -> bool:
