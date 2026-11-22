@@ -42,6 +42,43 @@ class FakeStream:
 
 
 class PersonLinkTests(unittest.IsolatedAsyncioTestCase):
+    async def test_person_demographics_require_stable_gender_change(self) -> None:
+        redis = FakeRedis()
+        redis.hashes["person:p1"] = {"person_id": "person:p1"}
+        service = object.__new__(MatcherService)
+        service._hot_state_redis = redis
+
+        async def observe(event_id: str, gender: str, age: int) -> None:
+            await service._update_person_demographics(
+                "person:p1",
+                {
+                    "detection_type": "face",
+                    "source_event_id": event_id,
+                    "gender": gender,
+                    "age": age,
+                },
+            )
+
+        await observe("event-1", "male", 31)
+        self.assertEqual(redis.hashes["person:p1"]["gender"], "male")
+        self.assertEqual(redis.hashes["person:p1"]["age"], "31")
+
+        await observe("event-2", "female", 32)
+        self.assertEqual(redis.hashes["person:p1"]["gender"], "male")
+
+        await observe("event-3", "male", 58)
+        self.assertEqual(redis.hashes["person:p1"]["gender"], "male")
+
+        await observe("event-4", "female", 30)
+        person = redis.hashes["person:p1"]
+        self.assertEqual(person["gender"], "female")
+        self.assertEqual(person["gender_source"], "face_aggregated")
+        self.assertEqual(person["age"], "32")
+        self.assertEqual(len(json.loads(person["face_gender_samples"])), 3)
+
+        await observe("event-4", "female", 30)
+        self.assertEqual(len(json.loads(person["face_gender_samples"])), 3)
+
     async def test_confirm_person_link_preserves_person_ownership(self) -> None:
         redis = FakeRedis()
         redis.hashes.update(

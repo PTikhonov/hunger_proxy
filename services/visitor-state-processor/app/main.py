@@ -145,6 +145,10 @@ class VisitorStateProcessor:
                 bbox=payload.bbox,
                 age=extraction.age if extraction.age is not None else payload.age,
                 gender=extraction.gender or payload.gender,
+                body_age=extraction.body_age if detection_type == "silhouette" else None,
+                body_gender=(extraction.body_gender or extraction.gender or payload.gender)
+                if detection_type == "silhouette"
+                else None,
                 head_pose=extraction.head_pose if detection_type == "face" else payload.head_pose,
                 media=payload.media,
                 raw_detection=payload.model_dump(mode="json"),
@@ -251,7 +255,7 @@ class VisitorStateProcessor:
             key, "face_age", "face_gender", "silhouette_age", "silhouette_gender"
         )
         total_presence_seconds = await self._presence_total_seconds(key, previous_seen_raw, observed_ts)
-        media_links = await self._media_links(key, payload)
+        media_links = await self._media_links(key, payload, extraction, detection_type)
         camera_ids = await self._append_unique_json_values(
             key,
             "camera_ids",
@@ -381,7 +385,13 @@ class VisitorStateProcessor:
             await self._hot_state_redis.hset(key, mapping=mapping)
             await self._hot_state_redis.expire(key, settings.identity_ttl_seconds)
 
-    async def _media_links(self, key: str, payload: DetectionPayload) -> list[dict[str, Any]]:
+    async def _media_links(
+        self,
+        key: str,
+        payload: DetectionPayload,
+        extraction: Any,
+        detection_type: str,
+    ) -> list[dict[str, Any]]:
         existing_raw = await self._hot_state_redis.hget(key, "media_links")
         try:
             existing = json.loads(existing_raw) if existing_raw else []
@@ -389,6 +399,8 @@ class VisitorStateProcessor:
             existing = []
         if not isinstance(existing, list):
             existing = []
+
+        event_age, event_gender = _event_demographics(payload, extraction, detection_type)
 
         links_by_url: dict[str, dict[str, Any]] = {}
         for item in existing:
@@ -415,6 +427,8 @@ class VisitorStateProcessor:
                 "camera_id": payload.camera_id or "",
                 "source_event_id": payload.event_id,
                 "event_timestamp": payload.event_timestamp or "",
+                "event_age": event_age,
+                "event_gender": event_gender,
             }
             links_by_url[link["public_url"]] = link
 
@@ -499,6 +513,17 @@ class VisitorStateProcessor:
         if delta <= settings.presence_gap_seconds:
             return previous_total + delta
         return previous_total
+
+
+def _event_demographics(payload: DetectionPayload, extraction: Any, detection_type: str) -> tuple[str, str]:
+    """Return only demographics detected for this event, never values from identity history."""
+    if detection_type == "silhouette":
+        age = extraction.body_age or (payload.age if payload.age is not None else "")
+        gender = extraction.body_gender or extraction.gender or payload.gender or ""
+    else:
+        age = extraction.age if extraction.age is not None else (payload.age if payload.age is not None else "")
+        gender = extraction.gender or payload.gender or ""
+    return str(age), str(gender)
 
 
 async def main() -> None:

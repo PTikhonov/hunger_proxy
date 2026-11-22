@@ -359,18 +359,6 @@ class MatcherService:
             "updated_at": now,
             "last_seen_at": str(observation.get("last_seen_at") or now),
         }
-        silhouette_age = str(identity_fields.get("silhouette_age") or identity_fields.get("body_age") or "")
-        silhouette_gender = str(identity_fields.get("silhouette_gender") or identity_fields.get("body_gender") or "")
-        person_mapping.update({
-            "silhouette_age": silhouette_age,
-            "silhouette_gender": silhouette_gender,
-        })
-        if not person_fields.get("face_age") and silhouette_age:
-            person_mapping["age"] = silhouette_age
-            person_mapping["age_source"] = "silhouette"
-        if not person_fields.get("face_gender") and silhouette_gender:
-            person_mapping["gender"] = silhouette_gender
-            person_mapping["gender_source"] = "silhouette"
         if first_seen_epoch is not None:
             person_mapping["first_seen_epoch"] = str(first_seen_epoch)
         if last_seen_epoch is not None:
@@ -383,6 +371,7 @@ class MatcherService:
         await self._hot_state_redis.hset(identity_key, mapping={"person_id": person_id, "person_matched_at": now})
         await self._hot_state_redis.hset(person_key, mapping=person_mapping)
         await self._hot_state_redis.expire(person_key, settings.person_ttl_seconds)
+        await self._update_person_demographics(person_id, observation)
         if person_created:
             logger.info(
                 "Created silhouette person person_id=%s silhouette_identity_id=%s camera_id=%s message_id=%s",
@@ -394,7 +383,7 @@ class MatcherService:
         return person_id
 
     async def _sync_face_demographics_to_person(self, observation: dict[str, Any]) -> None:
-        """Refresh demographic fields for an already linked face without rematching it."""
+        """Add a new face measurement to its linked person's demographic history."""
         face_identity_id = str(observation.get("identity_id") or "")
         if not face_identity_id:
             return
@@ -402,13 +391,79 @@ class MatcherService:
         person_id = str(face_fields.get("person_id") or "")
         if not person_id or not await self._hot_state_redis.exists(person_id):
             return
-        face_age = str(face_fields.get("face_age") or face_fields.get("age") or "")
-        face_gender = str(face_fields.get("face_gender") or face_fields.get("gender") or "")
-        mapping = {"updated_at": datetime.now(timezone.utc).isoformat()}
-        if face_age:
-            mapping.update({"face_age": face_age, "age": face_age, "age_source": "face"})
+        await self._update_person_demographics(person_id, observation)
+
+    async def _update_person_demographics(self, person_id: str, observation: dict[str, Any]) -> None:
+        """Aggregate new demographic measurements instead of copying the last event.
+
+        A first measurement is applied immediately. Later gender changes require a
+        stable opposing majority in the bounded recent-measurements window.
+        """
+        detection_type = str(observation.get("detection_type") or "")
+        if detection_type not in {"face", "silhouette"}:
+            return
+
+        source = "face" if detection_type == "face" else "silhouette"
+        gender = _observation_gender(observation, source)
+        age = _observation_age(observation, source)
+        if not gender and age is None:
+            return
+
+        person_fields = await self._hot_state_redis.hgetall(person_id)
+        if not person_fields:
+            return
+        sample_id = str(observation.get("source_event_id") or observation.get("event_id") or "")
+        if not sample_id:
+            return
+
+        mapping: dict[str, str] = {"updated_at": datetime.now(timezone.utc).isoformat()}
+        if gender:
+            samples_key = f"{source}_gender_samples"
+            samples, added = _append_demographic_sample(
+                _demographic_samples(person_fields.get(samples_key)),
+                sample_id,
+                gender,
+                settings.demographics_history_size,
+            )
+            if added:
+                current = _normalized_gender(person_fields.get(f"{source}_gender"))
+                aggregate = _aggregate_gender(
+                    samples,
+                    current,
+                    settings.demographics_gender_switch_min_votes,
+                )
+                mapping[samples_key] = json.dumps(samples, ensure_ascii=True)
+                mapping[f"{source}_gender"] = aggregate
+                mapping[f"last_{source}_gender"] = gender
+
+        if age is not None:
+            samples_key = f"{source}_age_samples"
+            samples, added = _append_demographic_sample(
+                _demographic_samples(person_fields.get(samples_key)),
+                sample_id,
+                str(age),
+                settings.demographics_history_size,
+            )
+            if added:
+                aggregate = _aggregate_age(samples, source)
+                if aggregate:
+                    mapping[samples_key] = json.dumps(samples, ensure_ascii=True)
+                    mapping[f"{source}_age"] = aggregate
+                    mapping[f"last_{source}_age"] = str(age)
+
+        face_gender = mapping.get("face_gender") or person_fields.get("face_gender") or ""
+        silhouette_gender = mapping.get("silhouette_gender") or person_fields.get("silhouette_gender") or ""
+        face_age = mapping.get("face_age") or person_fields.get("face_age") or ""
+        silhouette_age = mapping.get("silhouette_age") or person_fields.get("silhouette_age") or ""
         if face_gender:
-            mapping.update({"face_gender": face_gender, "gender": face_gender, "gender_source": "face"})
+            mapping.update({"gender": face_gender, "gender_source": "face_aggregated"})
+        elif silhouette_gender:
+            mapping.update({"gender": silhouette_gender, "gender_source": "silhouette_aggregated"})
+        if face_age:
+            mapping.update({"age": face_age, "age_source": "face_median"})
+        elif silhouette_age:
+            mapping.update({"age": silhouette_age, "age_source": "silhouette_aggregated"})
+
         if len(mapping) > 1:
             await self._hot_state_redis.hset(person_id, mapping=mapping)
 
@@ -1049,31 +1104,12 @@ class MatcherService:
             "last_face_source_event_id": str(pending.observation.get("source_event_id") or ""),
             "last_body_source_event_id": str(candidate.get("source_event_id") or ""),
         }
-        face_age = str(face_fields.get("face_age") or face_fields.get("age") or "")
-        face_gender = str(face_fields.get("face_gender") or face_fields.get("gender") or "")
-        silhouette_age = str(silhouette_fields.get("silhouette_age") or silhouette_fields.get("body_age") or "")
-        silhouette_gender = str(
-            silhouette_fields.get("silhouette_gender") or silhouette_fields.get("body_gender") or ""
-        )
-        person_mapping.update({
-            "face_age": face_age,
-            "face_gender": face_gender,
-            "silhouette_age": silhouette_age,
-            "silhouette_gender": silhouette_gender,
-        })
-        if face_age:
-            person_mapping.update({"age": face_age, "age_source": "face"})
-        elif silhouette_age:
-            person_mapping.update({"age": silhouette_age, "age_source": "silhouette"})
-        if face_gender:
-            person_mapping.update({"gender": face_gender, "gender_source": "face"})
-        elif silhouette_gender:
-            person_mapping.update({"gender": silhouette_gender, "gender_source": "silhouette"})
-
         await self._hot_state_redis.hset(face_key, mapping=face_mapping)
         await self._hot_state_redis.hset(silhouette_key, mapping=silhouette_mapping)
         await self._hot_state_redis.hset(person_key, mapping=person_mapping)
         await self._hot_state_redis.expire(person_key, settings.person_ttl_seconds)
+        await self._update_person_demographics(person_id, pending.observation)
+        await self._update_person_demographics(person_id, _candidate_observation(candidate))
 
         event_payload = {
             "event_type": "person_matched",
@@ -1191,6 +1227,101 @@ def _float_or_none(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _normalized_gender(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    aliases = {
+        "male": "male",
+        "m": "male",
+        "man": "male",
+        "female": "female",
+        "f": "female",
+        "woman": "female",
+    }
+    return aliases.get(normalized, "")
+
+
+def _observation_gender(observation: dict[str, Any], source: str) -> str:
+    value = observation.get("gender") if source == "face" else (observation.get("body_gender") or observation.get("gender"))
+    return _normalized_gender(value)
+
+
+def _observation_age(observation: dict[str, Any], source: str) -> str | None:
+    value = observation.get("age") if source == "face" else (observation.get("body_age") or observation.get("age"))
+    normalized = str(value or "").strip()
+    if not normalized:
+        return None
+    if source == "face":
+        numeric = _float_or_none(normalized)
+        if numeric is None or not 1 <= numeric <= 120:
+            return None
+    return normalized
+
+
+def _demographic_samples(value: str | None) -> list[dict[str, str]]:
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    samples: list[dict[str, str]] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        sample_id = str(item.get("id") or "").strip()
+        sample_value = str(item.get("value") or "").strip()
+        if sample_id and sample_value:
+            samples.append({"id": sample_id, "value": sample_value})
+    return samples
+
+
+def _append_demographic_sample(
+    samples: list[dict[str, str]],
+    sample_id: str,
+    value: str,
+    history_size: int,
+) -> tuple[list[dict[str, str]], bool]:
+    if any(sample["id"] == sample_id for sample in samples):
+        return samples, False
+    limit = max(1, history_size)
+    return [*samples, {"id": sample_id, "value": value}][-limit:], True
+
+
+def _aggregate_gender(samples: list[dict[str, str]], current: str, switch_min_votes: int) -> str:
+    values = [_normalized_gender(sample.get("value")) for sample in samples]
+    values = [value for value in values if value]
+    if not values:
+        return current
+    if not current:
+        return values[-1]
+
+    counts = {value: values.count(value) for value in {"male", "female"}}
+    challenger = "female" if current == "male" else "male"
+    if counts[challenger] >= max(1, switch_min_votes) and counts[challenger] > counts[current]:
+        return challenger
+    return current
+
+
+def _aggregate_age(samples: list[dict[str, str]], source: str) -> str:
+    values = [str(sample.get("value") or "").strip() for sample in samples]
+    values = [value for value in values if value]
+    if not values:
+        return ""
+
+    if source == "face":
+        numeric = sorted(value for value in (_float_or_none(item) for item in values) if value is not None)
+        if numeric:
+            middle = len(numeric) // 2
+            median = numeric[middle] if len(numeric) % 2 else (numeric[middle - 1] + numeric[middle]) / 2
+            return str(int(median)) if median.is_integer() else f"{median:.1f}"
+
+    counts = {value: values.count(value) for value in set(values)}
+    maximum = max(counts.values())
+    return next(value for value in reversed(values) if counts[value] == maximum)
 
 
 def _min_optional_number(left: float | None, right: float | None) -> float | None:

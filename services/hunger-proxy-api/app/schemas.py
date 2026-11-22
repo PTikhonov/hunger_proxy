@@ -126,6 +126,7 @@ class PromotionRulesSnapshot(BaseModel):
     # rules snapshot and are never copied into the offer stream.
     delivery: dict[str, Any] = Field(default_factory=dict)
     rules: list[dict[str, Any]] = Field(default_factory=list)
+    cash_register_cameras: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
 class PromotionRulesRecord(BaseModel):

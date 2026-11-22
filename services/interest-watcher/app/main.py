@@ -274,15 +274,15 @@ class InterestWatcher:
         category_hits: dict[int, list[dict[str, Any]]] = {}
         for shelf in geometry.get("shelves") or []:
             shelf_id = str(shelf["shelf_id"])
-            intersects, point = ray_intersects_shelf(
+            plane_intersects, point = ray_intersects_shelf(
                 origin,
                 direction,
                 shelf["points"],
                 _viewing_direction(shelf),
             )
+            intersects, matched_category_id = _interest_match(shelf, direction, plane_intersects)
             if intersects:
                 hits.append(shelf_id)
-            matched_category_id = _matched_category_id(shelf, direction) if intersects else None
             detail = {"source_event_id": observation.get("source_event_id"), "head_bbox": full_bbox,
                       "head_pose": pose, "head_point": origin, "gaze_vector": direction,
                       "intersection_point": point, "observation_stream_id": message_id,
@@ -294,6 +294,7 @@ class InterestWatcher:
                 "category_2_id": shelf.get("category_2_id"),
                 "points_px": [_project_optional(geometry["camera"], item) for item in shelf["points"]],
                 "intersects": intersects,
+                "plane_intersects": plane_intersects,
                 "matched_category_id": matched_category_id,
                 "intersection_px": _project_optional(geometry["camera"], point),
                 "viewing_direction": _viewing_direction(shelf),
@@ -633,6 +634,16 @@ def _matched_category_id(shelf: dict[str, Any], direction: tuple[float, float, f
         if category_id is not None and side in configured_side:
             return int(category_id)
     return None
+
+
+def _interest_match(
+    shelf: dict[str, Any], direction: tuple[float, float, float], plane_intersects: bool,
+) -> tuple[bool, int | None]:
+    """An interest hit requires both a plane hit and the configured viewing side."""
+    if not plane_intersects:
+        return False, None
+    category_id = _matched_category_id(shelf, direction)
+    return category_id is not None, category_id
 
 
 def _viewing_direction(shelf: dict[str, Any]) -> str:

@@ -198,7 +198,21 @@ class PromotionRulesStore:
             canonical_payload,
             ex=self._settings.promotion_rules_revision_ttl_seconds,
         )
+        await self._update_cash_register_cameras(location_id, payload.get("cash_register_cameras"))
         return StoredApplyResult(status=status, camera_id=location_id, revision=current_revision, checksum=current_checksum)  # type: ignore[arg-type]
+
+    async def _update_cash_register_cameras(self, location_id: str, cameras: Any) -> None:
+        if not isinstance(cameras, dict):
+            return
+        key = "hunger:cash-register-cameras"
+        existing = json.loads(await self._redis.get(key) or "{}")
+        prefix = f"{location_id}:"
+        for camera_id in [camera_id for camera_id in existing if camera_id.startswith(prefix)]:
+            existing.pop(camera_id, None)
+        for camera_id, register in cameras.items():
+            if isinstance(register, dict) and register.get("id") is not None:
+                existing[str(camera_id)] = str(register["id"])
+        await self._redis.set(key, json.dumps(existing, ensure_ascii=True))
 
     async def get(self, location_id: int | str) -> dict[str, Any] | None:
         fields = await self._redis.hgetall(self._key(str(location_id)))

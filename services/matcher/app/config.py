@@ -43,6 +43,8 @@ class Settings:
     )
     matcher_unmatched_face_retry_seconds: float = float(os.getenv("MATCHER_UNMATCHED_FACE_RETRY_SECONDS", "0"))
     person_ttl_seconds: int = int(os.getenv("PERSON_TTL_SECONDS", "3600"))
+    demographics_history_size: int = int(os.getenv("DEMOGRAPHICS_HISTORY_SIZE", "3"))
+    demographics_gender_switch_min_votes: int = int(os.getenv("DEMOGRAPHICS_GENDER_SWITCH_MIN_VOTES", "2"))
 
     extraction_api_url: str = os.getenv("EXTRACTION_API_URL", "http://192.168.1.25:18666/v2")
     extraction_timeout_seconds: float = float(os.getenv("EXTRACTION_TIMEOUT_SECONDS", "5"))

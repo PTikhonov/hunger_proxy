@@ -1,6 +1,6 @@
 import pytest
 
-from app.main import InvalidOffer, _layout_id_from_content, _target
+from app.main import InvalidOffer, _layout_id, _layout_id_from_content, _target
 
 
 def test_group_target_is_mapped_to_xibo_display_group() -> None:
@@ -21,6 +21,10 @@ def test_target_requires_exactly_one_player_selector() -> None:
 def test_content_accepts_plain_or_django_selector_layout_id() -> None:
     assert _layout_id_from_content({"content": "23"}) == 23
     assert _layout_id_from_content({"content": "23&Seasonal video"}) == 23
+
+
+def test_layout_id_is_preferred_over_empty_legacy_content() -> None:
+    assert _layout_id({"layout_id": 3, "content": ""}) == 3
 
 
 def test_content_requires_xibo_layout_id() -> None:

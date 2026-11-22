@@ -71,6 +71,17 @@ async def ready(request: Request) -> dict[str, str]:
     return {"status": "ready", "service": settings.app_name}
 
 
+@app.put("/internal/v1/cash-register-cameras", dependencies=[Depends(require_service_token)])
+async def put_cash_register_cameras(request: Request) -> dict[str, int]:
+    """Replace the small camera_id -> cash_register_id registry used locally."""
+    payload = await request.json()
+    mapping = payload.get("cameras") if isinstance(payload, dict) else None
+    if not isinstance(mapping, dict) or not all(str(key) and str(value) for key, value in mapping.items()):
+        raise HTTPException(status_code=422, detail="cameras must be a camera_id to cash_register_id object")
+    await request.app.state.redis.set("hunger:cash-register-cameras", __import__("json").dumps(mapping))
+    return {"count": len(mapping)}
+
+
 @app.put(
     "/internal/v1/cameras/{camera_id}/geometry",
     response_model=ApplyResult,

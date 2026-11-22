@@ -191,6 +191,12 @@ async def _delete_media_url(client: httpx.AsyncClient, semaphore: asyncio.Semaph
 def _person_from_hash(key: str, fields: dict[str, str], ttl_seconds: int) -> dict[str, Any]:
     linked_at = fields.get("linked_at") or fields.get("created_at") or fields.get("updated_at") or ""
     sort_epoch = _person_sort_epoch(fields)
+    face_age = fields.get("face_age") or ""
+    silhouette_age = fields.get("silhouette_age") or fields.get("body_age") or ""
+    face_gender = fields.get("face_gender") or ""
+    silhouette_gender = fields.get("silhouette_gender") or fields.get("body_gender") or ""
+    age = face_age or silhouette_age or fields.get("age") or ""
+    gender = face_gender or silhouette_gender or fields.get("gender") or ""
     face_identity_ids = _append_unique_strings(
         _json_string_list(fields.get("face_identity_ids")),
         fields.get("face_identity_id"),
@@ -229,6 +235,12 @@ def _person_from_hash(key: str, fields: dict[str, str], ttl_seconds: int) -> dic
         "linked_at": _format_iso(linked_at),
         "match_confidence": fields.get("match_confidence") or "",
         "match_status": fields.get("match_status") or "",
+        "age": age,
+        "age_source": "face" if face_age else ("silhouette" if silhouette_age else (fields.get("age_source") or "")),
+        "gender": gender,
+        "gender_source": "face"
+        if face_gender
+        else ("silhouette" if silhouette_gender else (fields.get("gender_source") or "")),
     }
 
 
@@ -1229,6 +1241,8 @@ INDEX_HTML = r"""
 
     function imageRow(item, gazeEnabled) {
       const normalizedUrl = item.normalized.public_url || item.normalized.upload_url || "";
+      const eventAge = item.normalized.event_age || "—";
+      const eventGender = item.normalized.event_gender || "—";
       const fullFrameUrl = item.fullFrame
         ? (item.fullFrame.public_url || item.fullFrame.upload_url || normalizedUrl)
         : inferFullFrameUrl(normalizedUrl);
@@ -1243,6 +1257,7 @@ INDEX_HTML = r"""
           <div class="link-meta">
             <strong>normalized</strong>
             <a ${fullFrameAttributes}>open full_frame</a>
+            <span>event age ${esc(eventAge)} | gender ${esc(eventGender)}</span>
             ${item.camera_id ? `<span>camera ${esc(item.camera_id)}</span>` : ""}
             <span>${esc(item.event_timestamp || "")}</span>
             <span>${esc(item.source_event_id || "")}</span>
@@ -1308,9 +1323,14 @@ INDEX_HTML = r"""
       }
       const faceLinks = identityLinks(identity.linked_face_identity_ids || [identity.linked_face_identity_id]);
       const bodyLinks = identityLinks(identity.linked_silhouette_identity_ids || [identity.linked_silhouette_identity_id]);
+      const age = identity.age || "—";
+      const gender = identity.gender || "—";
+      const ageSource = identity.age_source ? ` (${esc(identity.age_source)})` : "";
+      const genderSource = identity.gender_source ? ` (${esc(identity.gender_source)})` : "";
       return `
         <div class="meta">face ${faceLinks || ""}</div>
         <div class="meta">body ${bodyLinks || ""}</div>
+        <div class="meta">age ${esc(age)}${ageSource} | gender ${esc(gender)}${genderSource}</div>
         <div class="meta">confidence ${esc(identity.match_confidence || "")} | linked ${esc(identity.linked_at || "")}</div>
       `;
     }

@@ -128,7 +128,7 @@ class XiboDelivery:
     ) -> bool:
         action_id = _required_action_id(action)
         target_kind, target_id = _target(action)
-        layout_id = _layout_id_from_content(action)
+        layout_id = _layout_id(action)
         sent_key = f"{settings.sent_key_prefix}:{offer_id}:{action_id}"
         if await self.redis.exists(sent_key):
             return False
@@ -291,6 +291,14 @@ def _optional_positive_int(value: Any) -> int | None:
     if result <= 0:
         raise InvalidOffer("player target id must be a positive integer")
     return result
+
+
+def _layout_id(action: dict[str, Any]) -> int:
+    """Use the persisted Django layout selector before the legacy content field."""
+    layout_id = _optional_positive_int(action.get("layout_id"))
+    if layout_id:
+        return layout_id
+    return _layout_id_from_content(action)
 
 
 def _layout_id_from_content(action: dict[str, Any]) -> int:

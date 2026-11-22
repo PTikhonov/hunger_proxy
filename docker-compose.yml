@@ -250,6 +250,27 @@ services:
       redis-hot-state:
         condition: service_healthy
 
+  cashier-queue:
+    build:
+      context: ./services/cashier-queue
+    restart: unless-stopped
+    environment:
+      REDIS_STREAM_URL: redis://redis-streams:6379/0
+      REDIS_HOT_STATE_URL: redis://redis-hot-state:6379/0
+      REDIS_REGISTRY_URL: redis://redis-hot-state:6379/1
+      HUNGER_HEAD_URL: ${HUNGER_HEAD_URL:-http://192.168.1.25:7878}
+      HUNGER_HEAD_SERVICE_TOKEN: ${HUNGER_HEAD_SERVICE_TOKEN:-}
+      CASHIER_QUEUE_SESSION_SECRET: ${CASHIER_QUEUE_SESSION_SECRET:-change-me}
+      CASHIER_QUEUE_SHOW_IMAGES: ${CASHIER_QUEUE_SHOW_IMAGES:-true}
+      CASHIER_QUEUE_PENDING_IDLE_MS: ${CASHIER_QUEUE_PENDING_IDLE_MS:-10000}
+    ports:
+      - "8011:8011"
+    depends_on:
+      redis-streams:
+        condition: service_healthy
+      redis-hot-state:
+        condition: service_healthy
+
   telegram-delivery:
     build:
       context: ./services/telegram-delivery
@@ -287,7 +308,7 @@ services:
     restart: unless-stopped
     environment:
       APP_NAME: xibo-audio-delivery
-      XIBO_DELIVERY_ENABLED: ${XIBO_AUDIO_DELIVERY_ENABLED:-false}
+      XIBO_DELIVERY_ENABLED: ${XIBO_AUDIO_DELIVERY_ENABLED:-true}
       XIBO_DELIVERY_TYPE: xibo_audio
       XIBO_DELIVERY_LABEL: audio
       XIBO_DELIVERY_CONSUMER_GROUP: ${XIBO_AUDIO_DELIVERY_CONSUMER_GROUP:-xibo-audio-delivery}
@@ -320,7 +341,7 @@ services:
     restart: unless-stopped
     environment:
       APP_NAME: xibo-video-delivery
-      XIBO_DELIVERY_ENABLED: ${XIBO_VIDEO_DELIVERY_ENABLED:-false}
+      XIBO_DELIVERY_ENABLED: ${XIBO_VIDEO_DELIVERY_ENABLED:-true}
       XIBO_DELIVERY_TYPE: xibo_video
       XIBO_DELIVERY_LABEL: video
       XIBO_DELIVERY_CONSUMER_GROUP: ${XIBO_VIDEO_DELIVERY_CONSUMER_GROUP:-xibo-video-delivery}
