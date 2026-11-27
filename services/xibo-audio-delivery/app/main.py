@@ -79,7 +79,10 @@ class XiboDelivery:
             raise InvalidOffer("actions must be a list")
         xibo_actions = [
             action for action in actions
-            if isinstance(action, dict) and action.get("delivery_type") == settings.delivery_type
+            if isinstance(action, dict) and (
+                action.get("delivery_type") == settings.delivery_type
+                or settings.delivery_type in (action.get("delivery_types") or [])
+            )
         ]
         if not xibo_actions:
             return 0

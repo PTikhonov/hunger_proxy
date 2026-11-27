@@ -1,4 +1,4 @@
-from app.main import _action_is_active, _age_matches, _delivery_type, _offer_action, _select_promotion
+from app.main import _action_is_active, _age_matches, _delivery_type, _delivery_types, _offer_action, _select_promotion
 
 
 def test_selects_highest_priority_matching_context_and_keeps_all_its_actions() -> None:
@@ -53,6 +53,18 @@ def test_single_matching_context_does_not_depend_on_priority() -> None:
 def test_delivery_type_mapping() -> None:
     assert _delivery_type({"type": "Аудио-сообщение"}) == "xibo_audio"
     assert _delivery_type({"type": "Скрипт на кассе"}) == "cashier_script"
+
+
+def test_audio_action_can_target_xibo_and_slideshow() -> None:
+    action = {
+        "type": "Аудио-сообщение",
+        "player_group_id": 3,
+        "slideshow_device_id": 5,
+    }
+    channels = _delivery_types(action, {
+        "delivery": {"xibo": {"enabled": True}, "slideshow": {"enabled": True}},
+    })
+    assert channels == ["xibo_audio", "slideshow"]
 
 
 def test_action_contains_separate_personal_and_channel_cooldowns() -> None:

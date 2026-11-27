@@ -110,6 +110,9 @@ class OfferGenerator:
             if not _action_is_active(action):
                 continue
             offer_action = _offer_action(action, rules_payload)
+            if not offer_action["delivery_types"]:
+                logger.info("Action has no enabled delivery target action_id=%s", action.get("id"))
+                continue
             action_id = _required_positive_int(offer_action, "action_id")
             offer_id = _offer_id(message_id, action_id)
             cooldown_key = f"{settings.action_cooldown_prefix}:{person_id}:{location_id}:{action_id}"
@@ -121,6 +124,7 @@ class OfferGenerator:
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "person_id": person_id,
                 "location_id": location_id,
+                "project_id": _required_positive_int(rules_payload, "project_id"),
                 "camera_id": str(event.get("camera_id") or ""),
                 "category_id": category_id,
                 "interest": {
@@ -287,7 +291,11 @@ def _cooldown_kind(action: dict[str, Any]) -> str:
 def _offer_action(action: dict[str, Any], rules_payload: dict[str, Any]) -> dict[str, Any]:
     result = dict(action)
     result["action_id"] = action.get("id")
-    result["delivery_type"] = _delivery_type(action)
+    result["delivery_types"] = _delivery_types(action, rules_payload)
+    # Keep the former scalar field for adapters that have not yet been
+    # upgraded.  New adapters use ``delivery_types`` because one audio/video
+    # promotion can be sent to both Xibo and SlideShow.
+    result["delivery_type"] = result["delivery_types"][0] if result["delivery_types"] else ""
     cooldowns = rules_payload.get("cooldowns_seconds") if isinstance(rules_payload.get("cooldowns_seconds"), dict) else {}
     channel_cooldowns = rules_payload.get("channel_cooldowns_seconds") if isinstance(rules_payload.get("channel_cooldowns_seconds"), dict) else {}
     kind = _cooldown_kind(action)
@@ -326,6 +334,36 @@ def _delivery_type(action: dict[str, Any]) -> str:
     if "ai" in action_type or "консульт" in action_type:
         return "ai_consultant"
     return f"custom:{action.get('type_id') or 'unknown'}"
+
+
+def _delivery_types(action: dict[str, Any], rules_payload: dict[str, Any]) -> list[str]:
+    """Return every enabled delivery channel for one action.
+
+    Xibo and SlideShow are DSP targets, not independent action types.  They
+    can therefore both receive the same audio or video action.
+    """
+    base_type = _delivery_type(action)
+    if base_type not in {"xibo_audio", "xibo_video"}:
+        return [base_type]
+
+    delivery = rules_payload.get("delivery")
+    delivery = delivery if isinstance(delivery, dict) else {}
+    types: list[str] = []
+    xibo = delivery.get("xibo")
+    if (
+        isinstance(xibo, dict)
+        and bool(xibo.get("enabled", True))
+        and (action.get("player_group_id") or action.get("player_id"))
+    ):
+        types.append(base_type)
+    slideshow = delivery.get("slideshow")
+    if (
+        isinstance(slideshow, dict)
+        and bool(slideshow.get("enabled", True))
+        and (action.get("slideshow_group_id") or action.get("slideshow_device_id"))
+    ):
+        types.append("slideshow")
+    return types
 
 
 def _demographics(person: dict[str, str]) -> dict[str, Any]:

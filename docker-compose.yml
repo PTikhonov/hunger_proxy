@@ -302,6 +302,36 @@ services:
       redis-hot-state:
         condition: service_healthy
 
+  slideshow-delivery:
+    build:
+      context: ./services/slideshow-delivery
+    restart: unless-stopped
+    environment:
+      APP_NAME: slideshow-delivery
+      SLIDESHOW_DELIVERY_ENABLED: ${SLIDESHOW_DELIVERY_ENABLED:-true}
+      SLIDESHOW_DELIVERY_TOKEN: ${HUNGER_HEAD_SERVICE_TOKEN:-}
+      SLIDESHOW_DELIVERY_PORT: "8013"
+      REDIS_HOT_STATE_URL: redis://redis-hot-state:6379/0
+      REDIS_CONFIG_URL: redis://redis-hot-state:6379/1
+      SLIDESHOW_DEVICE_KEY_PREFIX: ${SLIDESHOW_DEVICE_KEY_PREFIX:-hunger:slideshow-devices:project}
+      OFFERS_STREAM: ${OFFERS_STREAM:-stream:offers}
+      SLIDESHOW_DELIVERY_CONSUMER_GROUP: ${SLIDESHOW_DELIVERY_CONSUMER_GROUP:-slideshow-delivery}
+      SLIDESHOW_DELIVERY_BATCH_SIZE: ${SLIDESHOW_DELIVERY_BATCH_SIZE:-10}
+      SLIDESHOW_DELIVERY_BLOCK_MS: ${SLIDESHOW_DELIVERY_BLOCK_MS:-5000}
+      SLIDESHOW_DELIVERY_PENDING_IDLE_MS: ${SLIDESHOW_DELIVERY_PENDING_IDLE_MS:-30000}
+      SLIDESHOW_DELIVERY_DEAD_LETTER_STREAM: ${SLIDESHOW_DELIVERY_DEAD_LETTER_STREAM:-stream:slideshow-delivery-dead-letter}
+      SLIDESHOW_DELIVERY_DEAD_LETTER_MAXLEN: ${SLIDESHOW_DELIVERY_DEAD_LETTER_MAXLEN:-10000}
+      SLIDESHOW_DELIVERY_SENT_KEY_PREFIX: ${SLIDESHOW_DELIVERY_SENT_KEY_PREFIX:-delivery:slideshow:sent}
+      SLIDESHOW_DELIVERY_COOLDOWN_KEY_PREFIX: ${SLIDESHOW_DELIVERY_COOLDOWN_KEY_PREFIX:-delivery:slideshow:cooldown}
+      SLIDESHOW_DELIVERY_SENT_TTL_SECONDS: ${SLIDESHOW_DELIVERY_SENT_TTL_SECONDS:-604800}
+      SLIDESHOW_DELIVERY_TIMEOUT_SECONDS: ${SLIDESHOW_DELIVERY_TIMEOUT_SECONDS:-10}
+      LOG_LEVEL: ${LOG_LEVEL:-DEBUG}
+    ports:
+      - "8013:8013"
+    depends_on:
+      redis-hot-state:
+        condition: service_healthy
+
   xibo-audio-delivery:
     build:
       context: ./services/xibo-audio-delivery
